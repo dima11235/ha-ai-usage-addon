@@ -1,0 +1,16 @@
+{
+  "configuration": {
+    "interval_minutes": {
+      "name": "Polling interval",
+      "description": "Minutes between subscription usage updates."
+    },
+    "poll_on_start": {
+      "name": "Poll on start",
+      "description": "Update Home Assistant immediately after the add-on starts."
+    },
+    "debug": {
+      "name": "Debug logging",
+      "description": "Enable additional diagnostics without logging credentials."
+    }
+  }
+}

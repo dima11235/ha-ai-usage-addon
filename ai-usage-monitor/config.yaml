@@ -1,0 +1,25 @@
+name: "AI Usage Monitor"
+version: "0.1.0"
+slug: ai_usage_monitor
+description: "Claude and Codex subscription usage monitor for Home Assistant"
+url: "https://github.com/dima11235/ha-ai-usage-addon"
+arch:
+  - amd64
+  - aarch64
+  - armv7
+startup: services
+boot: auto
+init: false
+homeassistant_api: true
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:gauge
+panel_title: "AI Usage"
+options:
+  interval_minutes: 15
+  poll_on_start: true
+  debug: false
+schema:
+  interval_minutes: int(5,1440)
+  poll_on_start: bool
+  debug: bool
