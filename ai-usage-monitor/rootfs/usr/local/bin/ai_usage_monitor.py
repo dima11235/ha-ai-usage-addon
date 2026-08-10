@@ -13,6 +13,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -100,11 +101,19 @@ def token_expiry(token: str) -> int | None:
 
 
 class HttpFailure(RuntimeError):
-    def __init__(self, status: int, message: str, body: str = "", headers: dict[str, str] | None = None):
+    def __init__(
+        self,
+        status: int,
+        message: str,
+        body: str = "",
+        headers: dict[str, str] | None = None,
+        url: str = "",
+    ):
         super().__init__(message)
         self.status = status
         self.body = body
         self.headers = headers or {}
+        self.url = url
 
 
 def http_request(
@@ -133,7 +142,7 @@ def http_request(
         raw = error.read(16 * 1024)
         body = raw.decode("utf-8", errors="replace")
         response_headers = {key.lower(): value for key, value in error.headers.items()}
-        raise HttpFailure(error.code, f"HTTP {error.code} from {url}", body, response_headers) from error
+        raise HttpFailure(error.code, f"HTTP {error.code} from {url}", body, response_headers, url) from error
     except urllib.error.URLError as error:
         raise RuntimeError(f"Request to {url} failed: {error.reason}") from error
 
@@ -169,8 +178,7 @@ def claude_needs_refresh(oauth: dict[str, Any]) -> bool:
     access_expiry = oauth.get("expiresAt")
     refresh_expiry = oauth.get("refreshTokenExpiresAt")
     try:
-        if int(access_expiry) <= now_ms + 5 * 60 * 1000:
-            return True
+        return int(access_expiry) <= now_ms + 5 * 60 * 1000
     except (TypeError, ValueError):
         pass
     try:
@@ -202,6 +210,7 @@ def refresh_claude(credentials: dict[str, Any]) -> str:
     oauth["accessToken"] = response["access_token"]
     oauth["refreshToken"] = response.get("refresh_token") or refresh_token
     oauth["expiresAt"] = int(time.time() * 1000) + int(response.get("expires_in", 3600)) * 1000
+    oauth["_aiUsageLastRefreshAt"] = int(time.time() * 1000)
     if response.get("refresh_token_expires_in") is not None:
         oauth["refreshTokenExpiresAt"] = (
             int(time.time() * 1000) + int(response["refresh_token_expires_in"]) * 1000
@@ -499,10 +508,19 @@ def safe_error(error: Exception) -> str:
         detail = ""
         try:
             parsed = json.loads(error.body)
-            detail = parsed.get("error", {}).get("message") or parsed.get("error_description") or ""
+            error_value = parsed.get("error")
+            if isinstance(error_value, dict):
+                detail = error_value.get("message") or error_value.get("type") or ""
+            elif isinstance(error_value, str):
+                detail = error_value
+            detail = detail or parsed.get("error_description") or parsed.get("message") or ""
         except Exception:
             pass
-        return f"HTTP {error.status}" + (f": {detail}" if detail else "")
+        endpoint = ""
+        if error.url:
+            parsed_url = urlsplit(error.url)
+            endpoint = f" ({parsed_url.netloc}{parsed_url.path})"
+        return f"HTTP {error.status}{endpoint}" + (f": {detail}" if detail else "")
     return str(error).replace("\n", " ")[:500]
 
 

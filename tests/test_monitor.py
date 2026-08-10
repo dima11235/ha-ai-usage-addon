@@ -52,6 +52,17 @@ class CredentialTests(unittest.TestCase):
 
 
 class RefreshTests(unittest.TestCase):
+    def test_claude_does_not_refresh_valid_access_token(self):
+        with patch.object(monitor.time, "time", return_value=1_000_000):
+            self.assertFalse(
+                monitor.claude_needs_refresh(
+                    {
+                        "expiresAt": 1_000_000_000 + 60 * 60 * 1000,
+                        "refreshTokenExpiresAt": 1_000_000_000 + 60 * 1000,
+                    }
+                )
+            )
+
     def test_claude_rotates_tokens(self):
         credentials = {
             "claudeAiOauth": {
