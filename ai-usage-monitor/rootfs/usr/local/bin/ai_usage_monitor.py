@@ -7,7 +7,6 @@ import base64
 import json
 import logging
 import os
-import secrets
 import tempfile
 import threading
 import time
@@ -44,7 +43,7 @@ CLAUDE_DEFAULT_SCOPES = [
 
 CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_DEFAULT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-CODEX_USAGE_URL = "https://chatgpt.com/backend-api/codex/responses"
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 ZAI_USAGE_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
 HA_EVENT_UPDATE = "ai_usage_monitor_update"
 
@@ -127,7 +126,7 @@ def http_request(
     json_body: dict[str, Any] | None = None,
     read_body: bool = True,
 ) -> tuple[int, dict[str, str], Any]:
-    request_headers = {"User-Agent": "ha-ai-usage-monitor/0.3.0", **(headers or {})}
+    request_headers = {"User-Agent": "ha-ai-usage-monitor/0.4.0", **(headers or {})}
     data = None
     if json_body is not None:
         data = json.dumps(json_body, separators=(",", ":")).encode("utf-8")
@@ -361,35 +360,19 @@ def fetch_claude_usage(access_token: str) -> dict[str, Any]:
     return value
 
 
-def fetch_codex_headers(access_token: str, account_id: str) -> dict[str, str]:
-    session_id = secrets.token_hex(16)
-    body = {
-        "model": "gpt-5.5",
-        "instructions": "",
-        "input": [
-            {
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": "ping"}],
-            }
-        ],
-        "stream": True,
-        "store": False,
-    }
-    _, headers, _ = http_request(
+def fetch_codex_usage(access_token: str, account_id: str) -> dict[str, Any]:
+    """Fetch Codex subscription windows without consuming a prompt."""
+    _, _, value = http_request(
         CODEX_USAGE_URL,
-        method="POST",
         headers={
             "Authorization": f"Bearer {access_token}",
             "chatgpt-account-id": account_id,
-            "OpenAI-Beta": "responses=experimental",
-            "originator": "codex_cli_rs",
-            "session_id": session_id,
+            "Accept": "application/json",
         },
-        json_body=body,
-        read_body=False,
     )
-    return headers
+    if not isinstance(value, dict):
+        raise RuntimeError("Codex usage response is not an object")
+    return value
 
 
 def fetch_zai_usage(api_key: str) -> dict[str, Any]:
@@ -421,8 +404,8 @@ def parse_float_or_none(value: Any) -> float | None:
         return None
 
 
-def normalize_zai_reset(value: Any) -> str | None:
-    """Normalize an epoch-millisecond or ISO z.ai reset timestamp."""
+def normalize_epoch_reset(value: Any) -> str | None:
+    """Normalize an epoch-second/millisecond or ISO reset timestamp."""
     numeric = parse_float_or_none(value)
     if numeric is not None:
         if numeric > 100_000_000_000:
@@ -431,6 +414,53 @@ def normalize_zai_reset(value: Any) -> str | None:
             timespec="seconds"
         )
     return normalize_iso(value)
+
+
+def parse_codex_usage(
+    response: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], str]:
+    """Map Codex usage response and honor explicit exhaustion flags."""
+    rate_limit = response.get("rate_limit")
+    if not isinstance(rate_limit, dict):
+        raise RuntimeError("Codex usage response has no rate_limit")
+
+    windows: dict[str, dict[str, Any]] = {
+        "5h": {"enabled": False},
+        "weekly": {"enabled": False},
+    }
+    filled: set[str] = set()
+    for slot in ("primary_window", "secondary_window"):
+        value = rate_limit.get(slot)
+        if not isinstance(value, dict):
+            continue
+        percent = parse_float_or_none(value.get("used_percent"))
+        seconds = parse_float_or_none(value.get("limit_window_seconds"))
+        if percent is None or seconds is None or seconds <= 0:
+            continue
+        window = "5h" if seconds / 60 <= 720 else "weekly"
+        if window in filled:
+            continue
+        remaining = parse_float_or_none(value.get("remaining_percent"))
+        if remaining is not None and remaining <= 0:
+            percent = 100
+        windows[window] = {
+            "enabled": True,
+            "used_percent": max(0.0, min(100.0, percent)),
+            "resets_at": normalize_epoch_reset(value.get("reset_at")),
+        }
+        filled.add(window)
+
+    if not filled:
+        raise RuntimeError("Codex response has no rate-limit windows")
+    if rate_limit.get("limit_reached") is True or rate_limit.get("allowed") is False:
+        exhausted = max(filled, key=lambda name: windows[name]["used_percent"])
+        windows[exhausted]["used_percent"] = 100.0
+    return windows, str(response.get("plan_type") or "")
+
+
+def normalize_zai_reset(value: Any) -> str | None:
+    """Normalize an epoch-millisecond or ISO z.ai reset timestamp."""
+    return normalize_epoch_reset(value)
 
 
 def parse_zai_usage(
@@ -464,6 +494,9 @@ def parse_zai_usage(
                 percent = current / total * 100
         if percent is None:
             continue
+        remaining = parse_float_or_none(limit.get("remaining"))
+        if remaining is not None and remaining <= 0:
+            percent = 100
         windows[window] = {
             "enabled": True,
             "used_percent": max(0.0, min(100.0, percent)),
@@ -585,57 +618,29 @@ class Monitor:
             access_token = refresh_codex(credentials)
             refreshed = True
         try:
-            headers = fetch_codex_headers(access_token, tokens["account_id"])
+            usage = fetch_codex_usage(access_token, tokens["account_id"])
         except HttpFailure as error:
             if error.status != HTTPStatus.UNAUTHORIZED or refreshed:
                 raise
             access_token = refresh_codex(credentials)
-            headers = fetch_codex_headers(access_token, tokens["account_id"])
+            usage = fetch_codex_usage(access_token, tokens["account_id"])
 
-        filled: set[str] = set()
+        windows, plan = parse_codex_usage(usage)
         values: dict[str, Any] = {}
-        windows: dict[str, dict[str, Any]] = {
-            "5h": {"enabled": False},
-            "weekly": {"enabled": False},
-        }
-        for slot in ("primary", "secondary"):
-            percent = headers.get(f"x-codex-{slot}-used-percent")
-            minutes = parse_float(headers.get(f"x-codex-{slot}-window-minutes"))
-            reset_epoch = headers.get(f"x-codex-{slot}-reset-at")
-            if percent is None or minutes <= 0:
-                continue
-            window = "5h" if minutes <= 720 else "weekly"
-            filled.add(window)
-            reset_iso = None
-            if reset_epoch:
-                reset_iso = datetime.fromtimestamp(
-                    int(reset_epoch), timezone.utc
-                ).isoformat(timespec="seconds")
-            percent_value = parse_float(percent)
-            windows[window] = {
-                "enabled": True,
-                "used_percent": percent_value,
-                "resets_at": reset_iso,
-            }
-            values[f"{window}_percent"] = percent_value
-            values[f"{window}_reset"] = reset_iso
-
-        if not filled:
-            raise RuntimeError("Codex response has no rate-limit headers")
-        for window in ("5h", "weekly"):
-            if window not in filled:
-                values[f"{window}_enabled"] = False
-            else:
-                values[f"{window}_enabled"] = True
-
-        plan = headers.get("x-codex-plan-type") or ""
+        for window, window_data in windows.items():
+            values[f"{window}_enabled"] = window_data["enabled"]
+            if window_data["enabled"]:
+                values[f"{window}_percent"] = window_data["used_percent"]
+                values[f"{window}_reset"] = window_data.get("resets_at")
         updated = iso_now()
         publish_ha_update("codex", updated, windows, plan=plan)
         self.update_provider(
             "codex", configured=True, error=None, last_ok=updated, plan=plan, **values
         )
         logging.info(
-            "Codex OK: %s, plan=%s", ", ".join(sorted(filled)), plan or "unknown"
+            "Codex OK: %s, plan=%s",
+            ", ".join(name for name, value in windows.items() if value["enabled"]),
+            plan or "unknown",
         )
 
     def poll_zai(self) -> None:
@@ -712,15 +717,38 @@ def safe_error(error: Exception) -> str:
 
 
 def load_options() -> dict[str, Any]:
-    defaults = {"interval_minutes": 15, "poll_on_start": True, "debug": False}
+    defaults = {"interval_minutes": 2, "poll_on_start": True, "debug": False}
     try:
         defaults.update(load_json(OPTIONS_PATH))
     except FileNotFoundError:
         pass
     except Exception as error:
         logging.warning("Cannot read options: %s", safe_error(error))
-    defaults["interval_minutes"] = max(5, min(1440, int(defaults["interval_minutes"])))
+    defaults["interval_minutes"] = max(2, min(1440, int(defaults["interval_minutes"])))
     return defaults
+
+
+def next_poll_delay(monitor: Monitor, now: datetime | None = None) -> float:
+    """Return regular interval or an earlier moment just after a quota reset."""
+    current = now or utc_now()
+    delay = float(int(monitor.options["interval_minutes"]) * 60)
+    snapshot = monitor.snapshot()
+    for provider in ("claude", "codex", "zai"):
+        state = snapshot.get(provider)
+        if not isinstance(state, dict):
+            continue
+        for key in ("five_hour_reset", "5h_reset", "weekly_reset"):
+            value = state.get(key)
+            if not isinstance(value, str):
+                continue
+            normalized = normalize_iso(value)
+            try:
+                reset = datetime.fromisoformat(normalized) if normalized else None
+            except ValueError:
+                continue
+            if reset is not None and reset > current:
+                delay = min(delay, (reset - current).total_seconds() + 5)
+    return max(1.0, delay)
 
 
 PAGE = """<!doctype html>
@@ -828,9 +856,8 @@ class WebHandler(BaseHTTPRequestHandler):
 def scheduler(monitor: Monitor) -> None:
     if monitor.options.get("poll_on_start", True):
         monitor.poll_all()
-    interval = int(monitor.options["interval_minutes"]) * 60
     while True:
-        time.sleep(interval)
+        time.sleep(next_poll_delay(monitor))
         monitor.poll_all()
 
 

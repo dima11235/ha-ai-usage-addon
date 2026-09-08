@@ -11,8 +11,9 @@ the z.ai Coding Plan key:
 - z.ai Coding Plan API key (paste it into the password field)
 
 The credentials stay in the persistent private storage of this add-on. The
-default poll interval is 15 minutes. A failed provider does not block the other
-providers and does not overwrite the last successful Home Assistant values.
+default poll interval is 2 minutes, with an extra poll just after the nearest
+known reset. A failed provider does not block the other providers and does not
+overwrite the last successful Home Assistant values.
 
 The companion **AI Usage Monitor** custom integration must be installed and
 configured in Home Assistant. The add-on publishes updates for all three

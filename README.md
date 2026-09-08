@@ -8,6 +8,7 @@ The add-on:
 - polls Claude's 5-hour and weekly usage windows;
 - detects Codex rate-limit windows from response headers;
 - reads z.ai Coding Plan 5-hour and weekly quota windows;
+- polls every 2 minutes and schedules an extra poll just after a known reset;
 - refreshes and atomically persists rotating OAuth tokens;
 - publishes usage updates to the companion `ai_usage_monitor` Home Assistant
   integration through the internal event API;
@@ -48,6 +49,10 @@ The add-on therefore uses the OAuth credentials created by the official CLIs.
 Both providers rotate refresh tokens; a successful refresh is persisted before
 the next request. If a refresh token is revoked or expires, re-import a fresh
 credential file from the corresponding CLI.
+
+Codex usage is read from the non-consuming `GET /backend-api/wham/usage`
+endpoint. Explicit server-side exhaustion is reported as 100% even when the
+provider's rounded `used_percent` remains below 100.
 
 z.ai uses a long-lived Coding Plan API key. The add-on sends it only to
 `https://api.z.ai/api/monitor/usage/quota/limit` and stores it with mode `0600`.

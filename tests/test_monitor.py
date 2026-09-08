@@ -3,6 +3,7 @@ import importlib.util
 import json
 import sys
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -214,7 +215,8 @@ class ZaiUsageTests(unittest.TestCase):
                         {
                             "type": "CREDIT_LIMIT",
                             "unit": 6,
-                            "percentage": 20,
+                            "percentage": 94,
+                            "remaining": 0,
                         },
                     ],
                 }
@@ -222,8 +224,70 @@ class ZaiUsageTests(unittest.TestCase):
         )
         self.assertEqual(plan, "lite")
         self.assertEqual(windows["5h"]["used_percent"], 25.0)
-        self.assertEqual(windows["weekly"]["used_percent"], 20.0)
+        self.assertEqual(windows["weekly"]["used_percent"], 100.0)
         self.assertEqual(windows["5h"]["resets_at"], "2026-09-08T18:00:00+00:00")
+
+
+class CodexUsageTests(unittest.TestCase):
+    def test_limit_reached_forces_most_used_window_to_100(self):
+        windows, plan = monitor.parse_codex_usage(
+            {
+                "plan_type": "plus",
+                "rate_limit": {
+                    "allowed": False,
+                    "limit_reached": True,
+                    "primary_window": {
+                        "used_percent": 94,
+                        "limit_window_seconds": 18_000,
+                        "reset_at": 1_800_000_000,
+                    },
+                    "secondary_window": {
+                        "used_percent": 32,
+                        "limit_window_seconds": 604_800,
+                        "reset_at": 1_800_100_000,
+                    },
+                },
+            }
+        )
+        self.assertEqual(plan, "plus")
+        self.assertEqual(windows["5h"]["used_percent"], 100.0)
+        self.assertEqual(windows["weekly"]["used_percent"], 32.0)
+
+    def test_available_window_keeps_reported_percent(self):
+        windows, _ = monitor.parse_codex_usage(
+            {
+                "rate_limit": {
+                    "allowed": True,
+                    "limit_reached": False,
+                    "primary_window": {
+                        "used_percent": 94,
+                        "limit_window_seconds": 18_000,
+                    },
+                }
+            }
+        )
+        self.assertEqual(windows["5h"]["used_percent"], 94.0)
+
+
+class SchedulerTests(unittest.TestCase):
+    class FakeMonitor:
+        options = {"interval_minutes": 2}
+
+        def __init__(self, state):
+            self.state = state
+
+        def snapshot(self):
+            return self.state
+
+    def test_poll_is_scheduled_just_after_reset(self):
+        now = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+        fake = self.FakeMonitor({"codex": {"5h_reset": "2026-09-08T12:00:30+00:00"}})
+        self.assertEqual(monitor.next_poll_delay(fake, now), 35.0)
+
+    def test_past_reset_does_not_create_poll_loop(self):
+        now = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+        fake = self.FakeMonitor({"codex": {"5h_reset": "2026-09-08T11:59:30+00:00"}})
+        self.assertEqual(monitor.next_poll_delay(fake, now), 120.0)
 
 
 if __name__ == "__main__":
