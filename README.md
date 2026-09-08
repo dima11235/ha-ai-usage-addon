@@ -8,8 +8,8 @@ The add-on:
 - polls Claude's 5-hour and weekly usage windows;
 - detects Codex rate-limit windows from response headers;
 - refreshes and atomically persists rotating OAuth tokens;
-- updates the existing `input_number.ai_usage_*` and `input_text.ai_usage_*`
-  helpers through the internal Home Assistant API;
+- publishes usage updates to the companion `ai_usage_monitor` Home Assistant
+  integration through the internal event API;
 - provides an Ingress page for importing credentials and running a manual poll.
 
 ## Installation
@@ -28,15 +28,16 @@ Credential files are validated and stored only in the add-on's persistent
 `/data` directory with mode `0600`. They are excluded from the repository and
 never printed to logs.
 
-## Required Home Assistant entities
+## Required Home Assistant integration
 
-The add-on writes to the helpers supplied by the companion Home Assistant
-package `packages/modules/ai_usage_limits.yaml`:
+Install the companion custom integration from the Home Assistant configuration
+repository and add **AI Usage Monitor** under **Settings → Devices & services**.
+It listens for `ai_usage_monitor_update` events and owns these native entities:
 
-- `input_number.ai_usage_{claude,codex}_{5h,weekly}_percent`
-- `input_text.ai_usage_{claude,codex}_{5h,weekly}_reset`
-- `input_text.ai_usage_{claude,codex}_updated_at`
-- `input_text.ai_usage_codex_plan`
+- `sensor.{claude,codex}_usage_{5h,weekly}`
+- `sensor.{claude,codex}_usage_{5h,weekly}_reset`
+
+No Home Assistant helpers are required.
 
 ## OAuth behavior
 

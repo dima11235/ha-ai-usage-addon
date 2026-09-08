@@ -23,7 +23,9 @@ SPEC.loader.exec_module(monitor)
 
 
 def jwt(payload):
-    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode()
+    encoded = (
+        base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode()
+    )
     return f"header.{encoded}.signature"
 
 
@@ -78,12 +80,16 @@ class RefreshTests(unittest.TestCase):
             "refresh_token_expires_in": 7200,
             "scope": "user:profile",
         }
-        with patch.object(monitor, "http_request", return_value=(200, {}, response)) as request:
+        with patch.object(
+            monitor, "http_request", return_value=(200, {}, response)
+        ) as request:
             with patch.object(monitor, "atomic_write_json") as write:
                 token = monitor.refresh_claude(credentials)
         self.assertEqual(token, "new-access")
         self.assertEqual(credentials["claudeAiOauth"]["refreshToken"], "new-refresh")
-        self.assertEqual(request.call_args.kwargs["json_body"]["grant_type"], "refresh_token")
+        self.assertEqual(
+            request.call_args.kwargs["json_body"]["grant_type"], "refresh_token"
+        )
         write.assert_called_once()
 
     def test_codex_rotates_tokens(self):
@@ -100,13 +106,58 @@ class RefreshTests(unittest.TestCase):
             "access_token": "new-access",
             "refresh_token": "new-refresh",
         }
-        with patch.object(monitor, "http_request", return_value=(200, {}, response)) as request:
+        with patch.object(
+            monitor, "http_request", return_value=(200, {}, response)
+        ) as request:
             with patch.object(monitor, "atomic_write_json") as write:
                 token = monitor.refresh_codex(credentials)
         self.assertEqual(token, "new-access")
         self.assertEqual(credentials["tokens"]["refresh_token"], "new-refresh")
-        self.assertEqual(request.call_args.kwargs["json_body"]["client_id"], "app_test_client")
+        self.assertEqual(
+            request.call_args.kwargs["json_body"]["client_id"], "app_test_client"
+        )
         write.assert_called_once()
+
+
+class HomeAssistantPublishingTests(unittest.TestCase):
+    def test_publish_ha_update_uses_event_api(self):
+        windows = {
+            "5h": {
+                "enabled": True,
+                "used_percent": 12.5,
+                "resets_at": "2026-09-08T10:00:00+00:00",
+            },
+            "weekly": {
+                "enabled": True,
+                "used_percent": 34.0,
+                "resets_at": "2026-09-14T10:00:00+00:00",
+            },
+        }
+        with patch.object(monitor, "SUPERVISOR_TOKEN", "secret"):
+            with patch.object(
+                monitor, "http_request", return_value=(200, {}, None)
+            ) as request:
+                monitor.publish_ha_update(
+                    "codex",
+                    "2026-09-08T09:00:00+00:00",
+                    windows,
+                    plan="plus",
+                )
+
+        self.assertEqual(
+            request.call_args.args[0],
+            f"{monitor.HA_API}/events/{monitor.HA_EVENT_UPDATE}",
+        )
+        self.assertEqual(request.call_args.kwargs["method"], "POST")
+        self.assertEqual(
+            request.call_args.kwargs["json_body"],
+            {
+                "provider": "codex",
+                "updated_at": "2026-09-08T09:00:00+00:00",
+                "windows": windows,
+                "plan": "plus",
+            },
+        )
 
 
 if __name__ == "__main__":

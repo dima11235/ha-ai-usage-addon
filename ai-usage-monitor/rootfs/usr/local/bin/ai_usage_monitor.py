@@ -44,6 +44,7 @@ CLAUDE_DEFAULT_SCOPES = [
 CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_DEFAULT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/codex/responses"
+HA_EVENT_UPDATE = "ai_usage_monitor_update"
 
 MAX_IMPORT_SIZE = 128 * 1024
 REQUEST_TIMEOUT = 35
@@ -129,10 +130,14 @@ def http_request(
     if json_body is not None:
         data = json.dumps(json_body, separators=(",", ":")).encode("utf-8")
         request_headers.setdefault("Content-Type", "application/json")
-    request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
+    request = urllib.request.Request(
+        url, data=data, headers=request_headers, method=method
+    )
     try:
         with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
-            response_headers = {key.lower(): value for key, value in response.headers.items()}
+            response_headers = {
+                key.lower(): value for key, value in response.headers.items()
+            }
             raw = response.read() if read_body else b""
             parsed: Any = None
             if raw:
@@ -142,7 +147,9 @@ def http_request(
         raw = error.read(16 * 1024)
         body = raw.decode("utf-8", errors="replace")
         response_headers = {key.lower(): value for key, value in error.headers.items()}
-        raise HttpFailure(error.code, f"HTTP {error.code} from {url}", body, response_headers, url) from error
+        raise HttpFailure(
+            error.code, f"HTTP {error.code} from {url}", body, response_headers, url
+        ) from error
     except urllib.error.URLError as error:
         raise RuntimeError(f"Request to {url} failed: {error.reason}") from error
 
@@ -209,7 +216,9 @@ def refresh_claude(credentials: dict[str, Any]) -> str:
         raise RuntimeError("Claude refresh response has no access_token")
     oauth["accessToken"] = response["access_token"]
     oauth["refreshToken"] = response.get("refresh_token") or refresh_token
-    oauth["expiresAt"] = int(time.time() * 1000) + int(response.get("expires_in", 3600)) * 1000
+    oauth["expiresAt"] = (
+        int(time.time() * 1000) + int(response.get("expires_in", 3600)) * 1000
+    )
     oauth["_aiUsageLastRefreshAt"] = int(time.time() * 1000)
     if response.get("refresh_token_expires_in") is not None:
         oauth["refreshTokenExpiresAt"] = (
@@ -275,29 +284,39 @@ def normalize_iso(value: Any) -> str | None:
         if text.endswith("Z"):
             text = text[:-1] + "+00:00"
         try:
-            return datetime.fromisoformat(text).astimezone(timezone.utc).isoformat(timespec="seconds")
+            return (
+                datetime.fromisoformat(text)
+                .astimezone(timezone.utc)
+                .isoformat(timespec="seconds")
+            )
         except ValueError:
             return value
     return str(value)
 
 
-def ha_service(domain: str, service: str, body: dict[str, Any]) -> None:
+def publish_ha_update(
+    provider: str,
+    updated_at: str,
+    windows: dict[str, dict[str, Any]],
+    *,
+    plan: str | None = None,
+) -> None:
+    """Publish usage data for the companion Home Assistant integration."""
     if not SUPERVISOR_TOKEN:
         raise RuntimeError("SUPERVISOR_TOKEN is unavailable")
+    payload: dict[str, Any] = {
+        "provider": provider,
+        "updated_at": updated_at,
+        "windows": windows,
+    }
+    if plan:
+        payload["plan"] = plan
     http_request(
-        f"{HA_API}/services/{domain}/{service}",
+        f"{HA_API}/events/{HA_EVENT_UPDATE}",
         method="POST",
         headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"},
-        json_body=body,
+        json_body=payload,
     )
-
-
-def set_ha_number(name: str, value: float) -> None:
-    ha_service("input_number", "set_value", {"entity_id": f"input_number.{name}", "value": float(value)})
-
-
-def set_ha_text(name: str, value: str) -> None:
-    ha_service("input_text", "set_value", {"entity_id": f"input_text.{name}", "value": str(value)})
 
 
 def fetch_claude_usage(access_token: str) -> dict[str, Any]:
@@ -318,7 +337,13 @@ def fetch_codex_headers(access_token: str, account_id: str) -> dict[str, str]:
     body = {
         "model": "gpt-5.5",
         "instructions": "",
-        "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ping"}]}],
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "ping"}],
+            }
+        ],
         "stream": True,
         "store": False,
     }
@@ -380,7 +405,9 @@ class Monitor:
 
     def poll_claude(self) -> None:
         if not CLAUDE_PATH.exists():
-            self.update_provider("claude", configured=False, error="Credentials are not configured")
+            self.update_provider(
+                "claude", configured=False, error="Credentials are not configured"
+            )
             return
         credentials = load_json(CLAUDE_PATH)
         validate_claude_credentials(credentials)
@@ -406,13 +433,22 @@ class Monitor:
         week_reset = normalize_iso(seven_day.get("resets_at"))
         updated = iso_now()
 
-        set_ha_number("ai_usage_claude_5h_percent", five_percent)
-        set_ha_number("ai_usage_claude_weekly_percent", week_percent)
-        if five_reset:
-            set_ha_text("ai_usage_claude_5h_reset", five_reset)
-        if week_reset:
-            set_ha_text("ai_usage_claude_weekly_reset", week_reset)
-        set_ha_text("ai_usage_claude_updated_at", updated)
+        publish_ha_update(
+            "claude",
+            updated,
+            {
+                "5h": {
+                    "enabled": bool(five_hour),
+                    "used_percent": five_percent,
+                    "resets_at": five_reset,
+                },
+                "weekly": {
+                    "enabled": bool(seven_day),
+                    "used_percent": week_percent,
+                    "resets_at": week_reset,
+                },
+            },
+        )
         self.update_provider(
             "claude",
             configured=True,
@@ -427,7 +463,9 @@ class Monitor:
 
     def poll_codex(self) -> None:
         if not CODEX_PATH.exists():
-            self.update_provider("codex", configured=False, error="Credentials are not configured")
+            self.update_provider(
+                "codex", configured=False, error="Credentials are not configured"
+            )
             return
         credentials = load_json(CODEX_PATH)
         validate_codex_credentials(credentials)
@@ -447,6 +485,10 @@ class Monitor:
 
         filled: set[str] = set()
         values: dict[str, Any] = {}
+        windows: dict[str, dict[str, Any]] = {
+            "5h": {"enabled": False},
+            "weekly": {"enabled": False},
+        }
         for slot in ("primary", "secondary"):
             percent = headers.get(f"x-codex-{slot}-used-percent")
             minutes = parse_float(headers.get(f"x-codex-{slot}-window-minutes"))
@@ -457,11 +499,15 @@ class Monitor:
             filled.add(window)
             reset_iso = None
             if reset_epoch:
-                reset_iso = datetime.fromtimestamp(int(reset_epoch), timezone.utc).isoformat(timespec="seconds")
+                reset_iso = datetime.fromtimestamp(
+                    int(reset_epoch), timezone.utc
+                ).isoformat(timespec="seconds")
             percent_value = parse_float(percent)
-            set_ha_number(f"ai_usage_codex_{window}_percent", percent_value)
-            if reset_iso:
-                set_ha_text(f"ai_usage_codex_{window}_reset", reset_iso)
+            windows[window] = {
+                "enabled": True,
+                "used_percent": percent_value,
+                "resets_at": reset_iso,
+            }
             values[f"{window}_percent"] = percent_value
             values[f"{window}_reset"] = reset_iso
 
@@ -469,18 +515,19 @@ class Monitor:
             raise RuntimeError("Codex response has no rate-limit headers")
         for window in ("5h", "weekly"):
             if window not in filled:
-                set_ha_text(f"ai_usage_codex_{window}_reset", "None")
                 values[f"{window}_enabled"] = False
             else:
                 values[f"{window}_enabled"] = True
 
         plan = headers.get("x-codex-plan-type") or ""
         updated = iso_now()
-        if plan:
-            set_ha_text("ai_usage_codex_plan", plan)
-        set_ha_text("ai_usage_codex_updated_at", updated)
-        self.update_provider("codex", configured=True, error=None, last_ok=updated, plan=plan, **values)
-        logging.info("Codex OK: %s, plan=%s", ", ".join(sorted(filled)), plan or "unknown")
+        publish_ha_update("codex", updated, windows, plan=plan)
+        self.update_provider(
+            "codex", configured=True, error=None, last_ok=updated, plan=plan, **values
+        )
+        logging.info(
+            "Codex OK: %s, plan=%s", ", ".join(sorted(filled)), plan or "unknown"
+        )
 
     def poll_all(self) -> bool:
         if not self.lock.acquire(blocking=False):
@@ -489,13 +536,18 @@ class Monitor:
             self.state["polling"] = True
             self.state["last_poll"] = iso_now()
         try:
-            for provider, callback in (("claude", self.poll_claude), ("codex", self.poll_codex)):
+            for provider, callback in (
+                ("claude", self.poll_claude),
+                ("codex", self.poll_codex),
+            ):
                 try:
                     callback()
                 except Exception as error:
                     message = safe_error(error)
                     logging.error("%s FAIL: %s", provider.capitalize(), message)
-                    self.update_provider(provider, configured=True, error=message, last_error=iso_now())
+                    self.update_provider(
+                        provider, configured=True, error=message, last_error=iso_now()
+                    )
             return True
         finally:
             with self.state_lock:
@@ -513,7 +565,9 @@ def safe_error(error: Exception) -> str:
                 detail = error_value.get("message") or error_value.get("type") or ""
             elif isinstance(error_value, str):
                 detail = error_value
-            detail = detail or parsed.get("error_description") or parsed.get("message") or ""
+            detail = (
+                detail or parsed.get("error_description") or parsed.get("message") or ""
+            )
         except Exception:
             pass
         endpoint = ""
@@ -593,8 +647,13 @@ class WebHandler(BaseHTTPRequestHandler):
         if path.endswith("/api/poll"):
             started = not self.monitor.snapshot().get("polling", False)
             if started:
-                threading.Thread(target=self.monitor.poll_all, name="manual-poll", daemon=True).start()
-            self.send_json(HTTPStatus.ACCEPTED, {"message": "Опрос запущен" if started else "Опрос уже выполняется"})
+                threading.Thread(
+                    target=self.monitor.poll_all, name="manual-poll", daemon=True
+                ).start()
+            self.send_json(
+                HTTPStatus.ACCEPTED,
+                {"message": "Опрос запущен" if started else "Опрос уже выполняется"},
+            )
             return
         provider = None
         if path.endswith("/api/import/claude"):
@@ -618,7 +677,10 @@ class WebHandler(BaseHTTPRequestHandler):
                 validate_codex_credentials(value)
                 atomic_write_json(CODEX_PATH, value)
             self.monitor.update_provider(provider, configured=True, error=None)
-            self.send_json(HTTPStatus.OK, {"message": f"{provider.capitalize()}: файл импортирован"})
+            self.send_json(
+                HTTPStatus.OK,
+                {"message": f"{provider.capitalize()}: файл импортирован"},
+            )
         except Exception as error:
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": safe_error(error)})
 
@@ -639,10 +701,14 @@ def main() -> None:
         level=logging.DEBUG if options.get("debug") else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
-    logging.info("AI Usage Monitor starting; interval=%s min", options["interval_minutes"])
+    logging.info(
+        "AI Usage Monitor starting; interval=%s min", options["interval_minutes"]
+    )
     monitor = Monitor(options)
     WebHandler.monitor = monitor
-    threading.Thread(target=scheduler, args=(monitor,), name="scheduler", daemon=True).start()
+    threading.Thread(
+        target=scheduler, args=(monitor,), name="scheduler", daemon=True
+    ).start()
     server = ThreadingHTTPServer(("0.0.0.0", 8099), WebHandler)
     server.serve_forever()
 

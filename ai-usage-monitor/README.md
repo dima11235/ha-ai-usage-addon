@@ -12,5 +12,9 @@ The files stay in the persistent private storage of this add-on. The default
 poll interval is 15 minutes. A failed provider does not block the other provider
 and does not overwrite the last successful Home Assistant values.
 
+The companion **AI Usage Monitor** custom integration must be installed and
+configured in Home Assistant. The add-on publishes updates to it through the
+internal Home Assistant event API; no helpers are required.
+
 If the Web UI reports an OAuth refresh error, sign in again with the respective
 official CLI and re-import its credential file.
