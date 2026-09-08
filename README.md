@@ -1,12 +1,13 @@
 # AI Usage Monitor — Home Assistant add-on
 
-Home Assistant add-on that monitors the subscription usage limits of Claude and
-Codex without relying on a Windows scheduled task.
+Home Assistant add-on that monitors the subscription usage limits of Claude,
+Codex, and z.ai without relying on a Windows scheduled task.
 
 The add-on:
 
 - polls Claude's 5-hour and weekly usage windows;
 - detects Codex rate-limit windows from response headers;
+- reads z.ai Coding Plan 5-hour and weekly quota windows;
 - refreshes and atomically persists rotating OAuth tokens;
 - publishes usage updates to the companion `ai_usage_monitor` Home Assistant
   integration through the internal event API;
@@ -22,7 +23,8 @@ The add-on:
 5. Open the add-on Web UI and import:
    - Claude: `.claude/.credentials.json`
    - Codex: `.codex/auth.json`
-6. Click **Update now** and check both provider statuses.
+   - z.ai: Coding Plan API key entered directly in the Ingress page
+6. Click **Update now** and check all provider statuses.
 
 Credential files are validated and stored only in the add-on's persistent
 `/data` directory with mode `0600`. They are excluded from the repository and
@@ -34,8 +36,8 @@ Install the companion custom integration from the Home Assistant configuration
 repository and add **AI Usage Monitor** under **Settings → Devices & services**.
 It listens for `ai_usage_monitor_update` events and owns these native entities:
 
-- `sensor.{claude,codex}_usage_{5h,weekly}`
-- `sensor.{claude,codex}_usage_{5h,weekly}_reset`
+- `sensor.ai_usage_monitor_{claude,codex,zai}_usage_{5h,weekly}`
+- `sensor.ai_usage_monitor_{claude,codex,zai}_usage_{5h,weekly}_reset`
 
 No Home Assistant helpers are required.
 
@@ -46,6 +48,9 @@ The add-on therefore uses the OAuth credentials created by the official CLIs.
 Both providers rotate refresh tokens; a successful refresh is persisted before
 the next request. If a refresh token is revoked or expires, re-import a fresh
 credential file from the corresponding CLI.
+
+z.ai uses a long-lived Coding Plan API key. The add-on sends it only to
+`https://api.z.ai/api/monitor/usage/quota/limit` and stores it with mode `0600`.
 
 ## Development
 

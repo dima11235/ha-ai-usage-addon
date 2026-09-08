@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Home Assistant add-on for Claude and Codex subscription usage monitoring."""
+"""Home Assistant add-on for Claude, Codex, and z.ai usage monitoring."""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ DATA_DIR = Path(os.getenv("AI_USAGE_DATA_DIR", "/data"))
 OPTIONS_PATH = Path(os.getenv("AI_USAGE_OPTIONS_PATH", str(DATA_DIR / "options.json")))
 CLAUDE_PATH = DATA_DIR / "claude_credentials.json"
 CODEX_PATH = DATA_DIR / "codex_auth.json"
+ZAI_PATH = DATA_DIR / "zai_credentials.json"
 STATE_PATH = DATA_DIR / "state.json"
 
 HA_API = os.getenv("HA_API_URL", "http://supervisor/core/api").rstrip("/")
@@ -44,6 +45,7 @@ CLAUDE_DEFAULT_SCOPES = [
 CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_DEFAULT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/codex/responses"
+ZAI_USAGE_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
 HA_EVENT_UPDATE = "ai_usage_monitor_update"
 
 MAX_IMPORT_SIZE = 128 * 1024
@@ -125,7 +127,7 @@ def http_request(
     json_body: dict[str, Any] | None = None,
     read_body: bool = True,
 ) -> tuple[int, dict[str, str], Any]:
-    request_headers = {"User-Agent": "ha-ai-usage-monitor/0.1.0", **(headers or {})}
+    request_headers = {"User-Agent": "ha-ai-usage-monitor/0.3.0", **(headers or {})}
     data = None
     if json_body is not None:
         data = json.dumps(json_body, separators=(",", ":")).encode("utf-8")
@@ -171,6 +173,33 @@ def validate_codex_credentials(value: dict[str, Any]) -> None:
     for key in ("access_token", "refresh_token", "account_id"):
         if not isinstance(tokens.get(key), str) or not tokens[key]:
             raise ValueError(f"Codex {key} is missing")
+
+
+def zai_api_key(value: dict[str, Any]) -> str:
+    """Extract a z.ai Coding Plan key from supported JSON formats."""
+    containers = [value]
+    for key in ("env", "zai", "z.ai", "zai-coding-plan"):
+        nested = value.get(key)
+        if isinstance(nested, dict):
+            containers.append(nested)
+    for container in containers:
+        for key in (
+            "api_key",
+            "apiKey",
+            "key",
+            "token",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ZAI_API_KEY",
+        ):
+            candidate = container.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    raise ValueError("z.ai Coding Plan API key is missing")
+
+
+def validate_zai_credentials(value: dict[str, Any]) -> None:
+    """Validate an imported z.ai key without exposing its value."""
+    zai_api_key(value)
 
 
 def claude_oauth(value: dict[str, Any]) -> dict[str, Any]:
@@ -363,11 +392,89 @@ def fetch_codex_headers(access_token: str, account_id: str) -> dict[str, str]:
     return headers
 
 
+def fetch_zai_usage(api_key: str) -> dict[str, Any]:
+    """Fetch z.ai Coding Plan quota windows."""
+    _, _, value = http_request(
+        ZAI_USAGE_URL,
+        headers={
+            "Authorization": api_key,
+            "Accept-Language": "en-US,en",
+            "Accept": "application/json",
+        },
+    )
+    if not isinstance(value, dict):
+        raise RuntimeError("z.ai usage response is not an object")
+    return value
+
+
 def parse_float(value: Any) -> float:
     try:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def parse_float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_zai_reset(value: Any) -> str | None:
+    """Normalize an epoch-millisecond or ISO z.ai reset timestamp."""
+    numeric = parse_float_or_none(value)
+    if numeric is not None:
+        if numeric > 100_000_000_000:
+            numeric /= 1000
+        return datetime.fromtimestamp(numeric, timezone.utc).isoformat(
+            timespec="seconds"
+        )
+    return normalize_iso(value)
+
+
+def parse_zai_usage(
+    response: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], str]:
+    """Map both legacy token and current credit quotas to HA windows."""
+    data = response.get("data", response)
+    if not isinstance(data, dict) or not isinstance(data.get("limits"), list):
+        raise RuntimeError("z.ai usage response has no limits")
+
+    windows: dict[str, dict[str, Any]] = {
+        "5h": {"enabled": False},
+        "weekly": {"enabled": False},
+    }
+    filled: set[str] = set()
+    for limit in data["limits"]:
+        if not isinstance(limit, dict) or limit.get("type") not in (
+            "TOKENS_LIMIT",
+            "CREDIT_LIMIT",
+        ):
+            continue
+        unit = parse_float_or_none(limit.get("unit"))
+        window = "5h" if unit == 3 else "weekly" if unit == 6 else None
+        if window is None or window in filled:
+            continue
+        percent = parse_float_or_none(limit.get("percentage"))
+        if percent is None:
+            total = parse_float_or_none(limit.get("usage"))
+            current = parse_float_or_none(limit.get("currentValue"))
+            if total and current is not None:
+                percent = current / total * 100
+        if percent is None:
+            continue
+        windows[window] = {
+            "enabled": True,
+            "used_percent": max(0.0, min(100.0, percent)),
+            "resets_at": normalize_zai_reset(limit.get("nextResetTime")),
+        }
+        filled.add(window)
+
+    if not filled:
+        raise RuntimeError("z.ai response has no supported quota windows")
+    plan = data.get("level") or data.get("planName") or ""
+    return windows, str(plan)
 
 
 class Monitor:
@@ -380,10 +487,11 @@ class Monitor:
             "polling": False,
             "claude": {"configured": CLAUDE_PATH.exists()},
             "codex": {"configured": CODEX_PATH.exists()},
+            "zai": {"configured": ZAI_PATH.exists()},
         }
         try:
             saved = load_json(STATE_PATH)
-            for provider in ("claude", "codex"):
+            for provider in ("claude", "codex", "zai"):
                 if isinstance(saved.get(provider), dict):
                     self.state[provider].update(saved[provider])
         except Exception:
@@ -399,6 +507,7 @@ class Monitor:
             persistable = {
                 "claude": self.state.get("claude", {}),
                 "codex": self.state.get("codex", {}),
+                "zai": self.state.get("zai", {}),
                 "last_poll": self.state.get("last_poll"),
             }
             atomic_write_json(STATE_PATH, persistable)
@@ -529,6 +638,29 @@ class Monitor:
             "Codex OK: %s, plan=%s", ", ".join(sorted(filled)), plan or "unknown"
         )
 
+    def poll_zai(self) -> None:
+        if not ZAI_PATH.exists():
+            self.update_provider(
+                "zai", configured=False, error="Credentials are not configured"
+            )
+            return
+        credentials = load_json(ZAI_PATH)
+        api_key = zai_api_key(credentials)
+        windows, plan = parse_zai_usage(fetch_zai_usage(api_key))
+        updated = iso_now()
+        publish_ha_update("zai", updated, windows, plan=plan)
+        values: dict[str, Any] = {}
+        for window, window_data in windows.items():
+            values[f"{window}_enabled"] = window_data["enabled"]
+            if window_data["enabled"]:
+                values[f"{window}_percent"] = window_data["used_percent"]
+                values[f"{window}_reset"] = window_data.get("resets_at")
+        self.update_provider(
+            "zai", configured=True, error=None, last_ok=updated, plan=plan, **values
+        )
+        enabled = [window for window, value in windows.items() if value["enabled"]]
+        logging.info("z.ai OK: %s, plan=%s", ", ".join(enabled), plan or "unknown")
+
     def poll_all(self) -> bool:
         if not self.lock.acquire(blocking=False):
             return False
@@ -539,6 +671,7 @@ class Monitor:
             for provider, callback in (
                 ("claude", self.poll_claude),
                 ("codex", self.poll_codex),
+                ("zai", self.poll_zai),
             ):
                 try:
                     callback()
@@ -600,14 +733,16 @@ h1{font-size:24px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minma
 </style></head><body><main>
 <h1>AI Usage Monitor</h1><p class="muted">Файлы сохраняются только в защищённом каталоге <code>/data</code> add-on.</p>
 <div class="grid"><section class="card"><h2>Claude</h2><div id="claude">Загрузка…</div><label>Файл <code>.claude/.credentials.json</code><br><input id="claudeFile" type="file" accept="application/json"></label><br><button onclick="upload('claude')">Импортировать</button></section>
-<section class="card"><h2>Codex</h2><div id="codex">Загрузка…</div><label>Файл <code>.codex/auth.json</code><br><input id="codexFile" type="file" accept="application/json"></label><br><button onclick="upload('codex')">Импортировать</button></section></div>
+<section class="card"><h2>Codex</h2><div id="codex">Загрузка…</div><label>Файл <code>.codex/auth.json</code><br><input id="codexFile" type="file" accept="application/json"></label><br><button onclick="upload('codex')">Импортировать</button></section>
+<section class="card"><h2>z.ai</h2><div id="zai">Загрузка…</div><label>Ключ Coding Plan<br><input id="zaiKey" type="password" autocomplete="off"></label><br><button onclick="saveZai()">Сохранить ключ</button></section></div>
 <p><button onclick="pollNow()">Обновить сейчас</button> <span id="message" class="muted"></span></p>
 <script>
 const api=p=>new URL('./api/'+p,location.href).toString();
 function renderProvider(name,p){const el=document.getElementById(name);const cls=p.error?'bad':'ok';const usage=name==='claude'?`5h: ${p.five_hour_percent??'—'}%, неделя: ${p.weekly_percent??'—'}%`:`5h: ${p['5h_percent']??'—'}%, неделя: ${p.weekly_percent??'—'}%`;el.innerHTML=`<p class="${cls}">${p.configured?(p.error?'Ошибка':'Настроено'):'Не настроено'}</p><p>${usage}</p><p class="muted">Последнее обновление: ${p.last_ok??'—'}</p>${p.error?`<pre>${escapeHtml(p.error)}</pre>`:''}`}
 function escapeHtml(v){const d=document.createElement('div');d.textContent=v;return d.innerHTML}
-async function refresh(){const s=await (await fetch(api('status'))).json();renderProvider('claude',s.claude||{});renderProvider('codex',s.codex||{});document.getElementById('message').textContent=s.polling?'Выполняется опрос…':''}
+async function refresh(){const s=await (await fetch(api('status'))).json();renderProvider('claude',s.claude||{});renderProvider('codex',s.codex||{});renderProvider('zai',s.zai||{});document.getElementById('message').textContent=s.polling?'Выполняется опрос…':''}
 async function upload(name){const f=document.getElementById(name+'File').files[0];if(!f){alert('Выберите JSON-файл');return}const r=await fetch(api('import/'+name),{method:'POST',headers:{'Content-Type':'application/json'},body:await f.text()});const j=await r.json();document.getElementById('message').textContent=j.message||j.error||'';await refresh()}
+async function saveZai(){const key=document.getElementById('zaiKey').value.trim();if(!key){alert('Введите ключ Coding Plan');return}const r=await fetch(api('import/zai'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:key})});document.getElementById('zaiKey').value='';const j=await r.json();document.getElementById('message').textContent=j.message||j.error||'';await refresh()}
 async function pollNow(){const r=await fetch(api('poll'),{method:'POST'});const j=await r.json();document.getElementById('message').textContent=j.message||j.error||'';setTimeout(refresh,2000)}
 refresh();setInterval(refresh,5000);
 </script></main></body></html>"""
@@ -660,6 +795,8 @@ class WebHandler(BaseHTTPRequestHandler):
             provider = "claude"
         elif path.endswith("/api/import/codex"):
             provider = "codex"
+        elif path.endswith("/api/import/zai"):
+            provider = "zai"
         if provider is None:
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
             return
@@ -673,9 +810,12 @@ class WebHandler(BaseHTTPRequestHandler):
             if provider == "claude":
                 validate_claude_credentials(value)
                 atomic_write_json(CLAUDE_PATH, value)
-            else:
+            elif provider == "codex":
                 validate_codex_credentials(value)
                 atomic_write_json(CODEX_PATH, value)
+            else:
+                validate_zai_credentials(value)
+                atomic_write_json(ZAI_PATH, {"api_key": zai_api_key(value)})
             self.monitor.update_provider(provider, configured=True, error=None)
             self.send_json(
                 HTTPStatus.OK,

@@ -1,7 +1,7 @@
 name: "AI Usage Monitor"
-version: "0.2.0"
+version: "0.3.0"
 slug: ai_usage_monitor
-description: "Claude and Codex subscription usage monitor for Home Assistant"
+description: "Claude, Codex, and z.ai subscription usage monitor for Home Assistant"
 url: "https://github.com/dima11235/ha-ai-usage-addon"
 arch:
   - amd64

@@ -52,6 +52,15 @@ class CredentialTests(unittest.TestCase):
         }
         self.assertEqual(monitor.codex_client_id(credentials), "app_test_client")
 
+    def test_zai_validation_accepts_direct_key(self):
+        credentials = {"api_key": "zai_test"}
+        monitor.validate_zai_credentials(credentials)
+        self.assertEqual(monitor.zai_api_key(credentials), "zai_test")
+
+    def test_zai_key_can_come_from_claude_settings(self):
+        credentials = {"env": {"ANTHROPIC_AUTH_TOKEN": "zai_test"}}
+        self.assertEqual(monitor.zai_api_key(credentials), "zai_test")
+
 
 class RefreshTests(unittest.TestCase):
     def test_claude_does_not_refresh_valid_access_token(self):
@@ -158,6 +167,63 @@ class HomeAssistantPublishingTests(unittest.TestCase):
                 "plan": "plus",
             },
         )
+
+
+class ZaiUsageTests(unittest.TestCase):
+    def test_parse_zai_token_windows(self):
+        windows, plan = monitor.parse_zai_usage(
+            {
+                "data": {
+                    "level": "pro",
+                    "limits": [
+                        {
+                            "type": "TOKENS_LIMIT",
+                            "unit": 3,
+                            "percentage": 12,
+                            "nextResetTime": 1_800_000_000_000,
+                        },
+                        {
+                            "type": "TOKENS_LIMIT",
+                            "unit": 6,
+                            "percentage": 34,
+                            "nextResetTime": 1_800_100_000_000,
+                        },
+                        {"type": "TIME_LIMIT", "unit": 5, "percentage": 5},
+                    ],
+                }
+            }
+        )
+        self.assertEqual(plan, "pro")
+        self.assertEqual(windows["5h"]["used_percent"], 12.0)
+        self.assertEqual(windows["weekly"]["used_percent"], 34.0)
+        self.assertEqual(windows["5h"]["resets_at"], "2027-01-15T08:00:00+00:00")
+
+    def test_parse_zai_current_credit_windows(self):
+        windows, plan = monitor.parse_zai_usage(
+            {
+                "data": {
+                    "level": "lite",
+                    "limits": [
+                        {
+                            "type": "CREDIT_LIMIT",
+                            "unit": 3,
+                            "usage": 2000,
+                            "currentValue": 500,
+                            "nextResetTime": "2026-09-08T18:00:00Z",
+                        },
+                        {
+                            "type": "CREDIT_LIMIT",
+                            "unit": 6,
+                            "percentage": 20,
+                        },
+                    ],
+                }
+            }
+        )
+        self.assertEqual(plan, "lite")
+        self.assertEqual(windows["5h"]["used_percent"], 25.0)
+        self.assertEqual(windows["weekly"]["used_percent"], 20.0)
+        self.assertEqual(windows["5h"]["resets_at"], "2026-09-08T18:00:00+00:00")
 
 
 if __name__ == "__main__":
