@@ -51,6 +51,13 @@ CLAUDE_DEFAULT_SCOPES = [
 CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_DEFAULT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+# Device-code login of the Codex CLI: the user approves a short code on the
+# OpenAI page, the add-on polls for the authorization code on its own.
+CODEX_ISSUER = "https://auth.openai.com"
+CODEX_DEVICE_API = f"{CODEX_ISSUER}/api/accounts/deviceauth"
+CODEX_DEVICE_VERIFY_URL = f"{CODEX_ISSUER}/codex/device"
+CODEX_DEVICE_REDIRECT_URI = f"{CODEX_ISSUER}/deviceauth/callback"
+CODEX_LOGIN_TTL = 15 * 60
 ZAI_USAGE_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
 HA_EVENT_UPDATE = "ai_usage_monitor_update"
 
@@ -131,13 +138,17 @@ def http_request(
     method: str = "GET",
     headers: dict[str, str] | None = None,
     json_body: dict[str, Any] | None = None,
+    form_body: dict[str, str] | None = None,
     read_body: bool = True,
 ) -> tuple[int, dict[str, str], Any]:
-    request_headers = {"User-Agent": "ha-ai-usage-monitor/0.5.0", **(headers or {})}
+    request_headers = {"User-Agent": "ha-ai-usage-monitor/0.6.0", **(headers or {})}
     data = None
     if json_body is not None:
         data = json.dumps(json_body, separators=(",", ":")).encode("utf-8")
         request_headers.setdefault("Content-Type", "application/json")
+    elif form_body is not None:
+        data = urlencode(form_body).encode("ascii")
+        request_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
     request = urllib.request.Request(
         url, data=data, headers=request_headers, method=method
     )
@@ -372,6 +383,73 @@ def refresh_codex(credentials: dict[str, Any]) -> str:
     return tokens["access_token"]
 
 
+def request_codex_device_code() -> dict[str, Any]:
+    _, _, response = http_request(
+        f"{CODEX_DEVICE_API}/usercode",
+        method="POST",
+        json_body={"client_id": CODEX_DEFAULT_CLIENT_ID},
+    )
+    if not isinstance(response, dict) or not response.get("device_auth_id"):
+        raise RuntimeError("Codex device code response has no device_auth_id")
+    user_code = response.get("user_code") or response.get("usercode")
+    if not isinstance(user_code, str) or not user_code:
+        raise RuntimeError("Codex device code response has no user_code")
+    return {
+        "device_auth_id": response["device_auth_id"],
+        "user_code": user_code,
+        "interval": max(1.0, parse_float_or_none(response.get("interval")) or 5.0),
+    }
+
+
+def poll_codex_device_code(device_auth_id: str, user_code: str) -> dict[str, Any] | None:
+    """Return the authorization code once approved, None while still pending."""
+    try:
+        _, _, response = http_request(
+            f"{CODEX_DEVICE_API}/token",
+            method="POST",
+            json_body={"device_auth_id": device_auth_id, "user_code": user_code},
+        )
+    except HttpFailure as error:
+        if error.status in (HTTPStatus.FORBIDDEN, HTTPStatus.NOT_FOUND):
+            return None
+        raise
+    if not isinstance(response, dict) or not response.get("authorization_code"):
+        raise RuntimeError("Codex device token response has no authorization_code")
+    return response
+
+
+def exchange_codex_device_code(approved: dict[str, Any]) -> dict[str, Any]:
+    """Exchange an approved device code for an add-on-owned auth.json."""
+    _, _, response = http_request(
+        CODEX_TOKEN_URL,
+        method="POST",
+        form_body={
+            "grant_type": "authorization_code",
+            "code": approved["authorization_code"],
+            "redirect_uri": CODEX_DEVICE_REDIRECT_URI,
+            "client_id": CODEX_DEFAULT_CLIENT_ID,
+            "code_verifier": approved.get("code_verifier", ""),
+        },
+    )
+    if not isinstance(response, dict) or not response.get("refresh_token"):
+        raise RuntimeError("Codex login response has no refresh_token")
+    claims = decode_jwt_payload(response.get("id_token", ""))
+    auth = claims.get("https://api.openai.com/auth")
+    account_id = auth.get("chatgpt_account_id") if isinstance(auth, dict) else None
+    credentials = {
+        "OPENAI_API_KEY": None,
+        "tokens": {
+            "id_token": response.get("id_token", ""),
+            "access_token": response["access_token"],
+            "refresh_token": response["refresh_token"],
+            "account_id": account_id,
+        },
+        "last_refresh": iso_now(),
+    }
+    validate_codex_credentials(credentials)
+    return credentials
+
+
 def normalize_iso(value: Any) -> str | None:
     if not value:
         return None
@@ -593,6 +671,9 @@ class Monitor:
         # Pending in-panel Claude login: the PKCE verifier and state live only in
         # memory, so an add-on restart simply requires starting the login again.
         self.claude_login: dict[str, Any] | None = None
+        # Each Codex login attempt gets a new generation; a stale polling
+        # thread notices the change and stops.
+        self.codex_login_generation = 0
         try:
             saved = load_json(STATE_PATH)
             for provider in ("claude", "codex", "zai"):
@@ -643,6 +724,64 @@ class Monitor:
             self.lock.release()
         self.update_provider("claude", configured=True, error=None)
         logging.info("Claude login completed in the add-on")
+
+    def start_codex_login(self) -> dict[str, Any]:
+        device = request_codex_device_code()
+        with self.state_lock:
+            self.codex_login_generation += 1
+            generation = self.codex_login_generation
+            self.state["codex_login"] = {
+                "status": "pending",
+                "user_code": device["user_code"],
+                "url": CODEX_DEVICE_VERIFY_URL,
+            }
+        threading.Thread(
+            target=self._complete_codex_login,
+            args=(generation, device),
+            name="codex-login",
+            daemon=True,
+        ).start()
+        return self.snapshot()["codex_login"]
+
+    def _codex_login_current(self, generation: int) -> bool:
+        with self.state_lock:
+            return generation == self.codex_login_generation
+
+    def _set_codex_login(self, generation: int, **values: Any) -> None:
+        with self.state_lock:
+            if generation == self.codex_login_generation:
+                self.state["codex_login"] = values
+
+    def _complete_codex_login(self, generation: int, device: dict[str, Any]) -> None:
+        deadline = time.time() + CODEX_LOGIN_TTL
+        try:
+            approved = None
+            while approved is None:
+                if not self._codex_login_current(generation):
+                    return
+                if time.time() > deadline:
+                    raise RuntimeError("Код не подтверждён за 15 минут, начните вход заново")
+                time.sleep(device["interval"])
+                approved = poll_codex_device_code(
+                    device["device_auth_id"], device["user_code"]
+                )
+            credentials = exchange_codex_device_code(approved)
+            # Same ordering as the Claude login: never race a poll that may be
+            # rewriting the old file after a refresh.
+            if not self.lock.acquire(timeout=REQUEST_TIMEOUT * 3):
+                raise RuntimeError("Опрос не завершился, повторите вход")
+            try:
+                atomic_write_json(CODEX_PATH, credentials)
+            finally:
+                self.lock.release()
+        except Exception as error:
+            logging.error("Codex login FAIL: %s", safe_error(error))
+            self._set_codex_login(generation, status="error", error=safe_error(error))
+            return
+        self.update_provider("codex", configured=True, error=None)
+        self._set_codex_login(generation, status="done")
+        logging.info("Codex login completed in the add-on")
+        self.poll_all()
 
     def poll_claude(self) -> None:
         if not CLAUDE_PATH.exists():
@@ -860,18 +999,20 @@ h1{font-size:24px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minma
 </style></head><body><main>
 <h1>AI Usage Monitor</h1><p class="muted">Файлы сохраняются только в защищённом каталоге <code>/data</code> add-on.</p>
 <div class="grid"><section class="card"><h2>Claude</h2><div id="claude">Загрузка…</div><button onclick="claudeLogin()">Войти в Claude</button><div id="claudeLogin" hidden><p class="muted">Подтвердите вход на открывшейся странице (<a id="claudeLoginUrl" target="_blank" rel="noopener">ссылка</a>) и вставьте показанный там код.</p><input id="claudeCode" type="password" autocomplete="off" placeholder="Код со страницы Claude"><br><button onclick="claudeFinish()">Завершить вход</button></div><details><summary class="muted">Импорт файла</summary><p class="muted">Копия файла рабочего CLI перестаёт работать, как только CLI обновит токен, — лучше вход выше.</p><label>Файл <code>.claude/.credentials.json</code><br><input id="claudeFile" type="file" accept="application/json"></label><br><button onclick="upload('claude')">Импортировать</button></details></section>
-<section class="card"><h2>Codex</h2><div id="codex">Загрузка…</div><label>Файл <code>.codex/auth.json</code><br><input id="codexFile" type="file" accept="application/json"></label><br><button onclick="upload('codex')">Импортировать</button></section>
+<section class="card"><h2>Codex</h2><div id="codex">Загрузка…</div><button onclick="codexLogin()">Войти в Codex</button><div id="codexLogin"></div><details><summary class="muted">Импорт файла</summary><p class="muted">Копия файла рабочего CLI делит с ним refresh token — лучше вход выше.</p><label>Файл <code>.codex/auth.json</code><br><input id="codexFile" type="file" accept="application/json"></label><br><button onclick="upload('codex')">Импортировать</button></details></section>
 <section class="card"><h2>z.ai</h2><div id="zai">Загрузка…</div><label>Ключ Coding Plan<br><input id="zaiKey" type="password" autocomplete="off"></label><br><button onclick="saveZai()">Сохранить ключ</button></section></div>
 <p><button onclick="pollNow()">Обновить сейчас</button> <span id="message" class="muted"></span></p>
 <script>
 const api=p=>new URL('./api/'+p,location.href).toString();
 function renderProvider(name,p){const el=document.getElementById(name);const cls=p.error?'bad':'ok';const usage=name==='claude'?`5h: ${p.five_hour_percent??'—'}%, неделя: ${p.weekly_percent??'—'}%`:`5h: ${p['5h_percent']??'—'}%, неделя: ${p.weekly_percent??'—'}%`;el.innerHTML=`<p class="${cls}">${p.configured?(p.error?'Ошибка':'Настроено'):'Не настроено'}</p><p>${usage}</p><p class="muted">Последнее обновление: ${p.last_ok??'—'}</p>${p.error?`<pre>${escapeHtml(p.error)}</pre>`:''}`}
 function escapeHtml(v){const d=document.createElement('div');d.textContent=v;return d.innerHTML}
-async function refresh(){const s=await (await fetch(api('status'))).json();renderProvider('claude',s.claude||{});renderProvider('codex',s.codex||{});renderProvider('zai',s.zai||{});document.getElementById('message').textContent=s.polling?'Выполняется опрос…':''}
+async function refresh(){const s=await (await fetch(api('status'))).json();renderProvider('claude',s.claude||{});renderProvider('codex',s.codex||{});renderProvider('zai',s.zai||{});renderCodexLogin(s.codex_login);document.getElementById('message').textContent=s.polling?'Выполняется опрос…':''}
 async function upload(name){const f=document.getElementById(name+'File').files[0];if(!f){alert('Выберите JSON-файл');return}const r=await fetch(api('import/'+name),{method:'POST',headers:{'Content-Type':'application/json'},body:await f.text()});const j=await r.json();document.getElementById('message').textContent=j.message||j.error||'';await refresh()}
 async function saveZai(){const key=document.getElementById('zaiKey').value.trim();if(!key){alert('Введите ключ Coding Plan');return}const r=await fetch(api('import/zai'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:key})});document.getElementById('zaiKey').value='';const j=await r.json();document.getElementById('message').textContent=j.message||j.error||'';await refresh()}
 async function claudeLogin(){const j=await (await fetch(api('claude/login/start'),{method:'POST'})).json();document.getElementById('claudeLoginUrl').href=j.url;document.getElementById('claudeLogin').hidden=false;window.open(j.url,'_blank','noopener')}
 async function claudeFinish(){const code=document.getElementById('claudeCode').value.trim();if(!code){alert('Вставьте код со страницы Claude');return}const r=await fetch(api('claude/login/finish'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})});document.getElementById('claudeCode').value='';const j=await r.json();if(r.ok)document.getElementById('claudeLogin').hidden=true;document.getElementById('message').textContent=j.message||j.error||'';setTimeout(refresh,3000)}
+function renderCodexLogin(l){const el=document.getElementById('codexLogin');if(!l){el.innerHTML='';return}if(l.status==='pending')el.innerHTML=`<p>Откройте <a href="${l.url}" target="_blank" rel="noopener">${l.url}</a> и введите код <b><code>${escapeHtml(l.user_code)}</code></b>. Панель обновится сама.</p>`;else if(l.status==='done')el.innerHTML='<p class="ok">Вход в Codex выполнен</p>';else el.innerHTML=`<pre>${escapeHtml(l.error||'Ошибка входа')}</pre>`}
+async function codexLogin(){const r=await fetch(api('codex/login/start'),{method:'POST'});const j=await r.json();if(!r.ok){document.getElementById('message').textContent=j.error||'';return}renderCodexLogin(j);window.open(j.url,'_blank','noopener')}
 async function pollNow(){const r=await fetch(api('poll'),{method:'POST'});const j=await r.json();document.getElementById('message').textContent=j.message||j.error||'';setTimeout(refresh,2000)}
 refresh();setInterval(refresh,5000);
 </script></main></body></html>"""
@@ -927,6 +1068,14 @@ class WebHandler(BaseHTTPRequestHandler):
                 HTTPStatus.ACCEPTED,
                 {"message": "Опрос запущен" if started else "Опрос уже выполняется"},
             )
+            return
+        if path.endswith("/api/codex/login/start"):
+            try:
+                login = self.monitor.start_codex_login()
+            except Exception as error:
+                self.send_json(HTTPStatus.BAD_GATEWAY, {"error": safe_error(error)})
+                return
+            self.send_json(HTTPStatus.OK, login)
             return
         if path.endswith("/api/claude/login/start"):
             self.send_json(HTTPStatus.OK, {"url": self.monitor.start_claude_login()})

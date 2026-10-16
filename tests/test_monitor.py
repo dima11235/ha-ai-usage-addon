@@ -341,5 +341,51 @@ class ClaudeLoginTests(unittest.TestCase):
             fake.finish_claude_login("code#st")
 
 
+class CodexLoginTests(unittest.TestCase):
+    def test_device_code_parses_string_interval(self):
+        response = {"device_auth_id": "dev", "user_code": "AB12-CD34", "interval": "5"}
+        with patch.object(monitor, "http_request", return_value=(200, {}, response)):
+            device = monitor.request_codex_device_code()
+        self.assertEqual(device["user_code"], "AB12-CD34")
+        self.assertEqual(device["interval"], 5.0)
+
+    def test_device_poll_treats_403_as_pending(self):
+        failure = monitor.HttpFailure(403, "HTTP 403")
+        with patch.object(monitor, "http_request", side_effect=failure):
+            self.assertIsNone(monitor.poll_codex_device_code("dev", "AB12-CD34"))
+
+    def test_device_poll_raises_other_errors(self):
+        failure = monitor.HttpFailure(500, "HTTP 500")
+        with patch.object(monitor, "http_request", side_effect=failure):
+            with self.assertRaises(monitor.HttpFailure):
+                monitor.poll_codex_device_code("dev", "AB12-CD34")
+
+    def test_exchange_builds_auth_json_with_account(self):
+        id_token = jwt({"https://api.openai.com/auth": {"chatgpt_account_id": "acc"}})
+        response = {
+            "id_token": id_token,
+            "access_token": "access",
+            "refresh_token": "refresh",
+        }
+        approved = {"authorization_code": "code", "code_verifier": "verifier"}
+        with patch.object(
+            monitor, "http_request", return_value=(200, {}, response)
+        ) as request:
+            credentials = monitor.exchange_codex_device_code(approved)
+        body = request.call_args.kwargs["form_body"]
+        self.assertEqual(body["grant_type"], "authorization_code")
+        self.assertEqual(body["redirect_uri"], monitor.CODEX_DEVICE_REDIRECT_URI)
+        self.assertEqual(body["code_verifier"], "verifier")
+        self.assertEqual(credentials["tokens"]["account_id"], "acc")
+        self.assertEqual(credentials["tokens"]["refresh_token"], "refresh")
+
+    def test_exchange_requires_account(self):
+        response = {"id_token": jwt({}), "access_token": "a", "refresh_token": "r"}
+        approved = {"authorization_code": "code", "code_verifier": "verifier"}
+        with patch.object(monitor, "http_request", return_value=(200, {}, response)):
+            with self.assertRaisesRegex(ValueError, "account_id"):
+                monitor.exchange_codex_device_code(approved)
+
+
 if __name__ == "__main__":
     unittest.main()
