@@ -4,15 +4,17 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
+import secrets
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,6 +35,11 @@ SUPERVISOR_TOKEN = os.getenv("SUPERVISOR_TOKEN", "")
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+# Manual-redirect login of Claude Code: the callback page shows "code#state"
+# for the user to paste back, so the add-on needs no reachable redirect URL.
+CLAUDE_AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
+CLAUDE_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
+CLAUDE_LOGIN_TTL = 15 * 60
 CLAUDE_DEFAULT_SCOPES = [
     "user:profile",
     "user:inference",
@@ -126,7 +133,7 @@ def http_request(
     json_body: dict[str, Any] | None = None,
     read_body: bool = True,
 ) -> tuple[int, dict[str, str], Any]:
-    request_headers = {"User-Agent": "ha-ai-usage-monitor/0.4.0", **(headers or {})}
+    request_headers = {"User-Agent": "ha-ai-usage-monitor/0.5.0", **(headers or {})}
     data = None
     if json_body is not None:
         data = json.dumps(json_body, separators=(",", ":")).encode("utf-8")
@@ -257,6 +264,67 @@ def refresh_claude(credentials: dict[str, Any]) -> str:
         oauth["scopes"] = response_scope.split()
     atomic_write_json(CLAUDE_PATH, credentials)
     return oauth["accessToken"]
+
+
+def claude_pkce_pair() -> tuple[str, str]:
+    """Return a PKCE code verifier and its S256 challenge."""
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return verifier, base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+
+
+def claude_authorize_url(challenge: str, state: str) -> str:
+    query = urlencode(
+        {
+            "code": "true",
+            "client_id": CLAUDE_CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": CLAUDE_REDIRECT_URI,
+            "scope": " ".join(CLAUDE_DEFAULT_SCOPES),
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+        }
+    )
+    return f"{CLAUDE_AUTHORIZE_URL}?{query}"
+
+
+def exchange_claude_code(pasted: str, verifier: str, state: str) -> dict[str, Any]:
+    """Exchange a pasted "code#state" for an add-on-owned Claude OAuth grant."""
+    code, _, pasted_state = pasted.strip().partition("#")
+    if not code:
+        raise ValueError("Код авторизации пустой")
+    if pasted_state and pasted_state != state:
+        raise ValueError("Код от другой попытки входа, начните вход заново")
+    _, _, response = http_request(
+        CLAUDE_TOKEN_URL,
+        method="POST",
+        json_body={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": CLAUDE_REDIRECT_URI,
+            "client_id": CLAUDE_CLIENT_ID,
+            "code_verifier": verifier,
+            "state": state,
+        },
+    )
+    if not isinstance(response, dict) or not response.get("refresh_token"):
+        raise RuntimeError("Claude login response has no refresh_token")
+    now_ms = int(time.time() * 1000)
+    oauth: dict[str, Any] = {
+        "accessToken": response["access_token"],
+        "refreshToken": response["refresh_token"],
+        "expiresAt": now_ms + int(response.get("expires_in", 3600)) * 1000,
+        "scopes": str(response.get("scope") or "").split() or CLAUDE_DEFAULT_SCOPES,
+        "_aiUsageLoginAt": now_ms,
+    }
+    if response.get("refresh_token_expires_in") is not None:
+        oauth["refreshTokenExpiresAt"] = (
+            now_ms + int(response["refresh_token_expires_in"]) * 1000
+        )
+    credentials = {"claudeAiOauth": oauth}
+    validate_claude_credentials(credentials)
+    return credentials
 
 
 def codex_client_id(credentials: dict[str, Any]) -> str:
@@ -522,6 +590,9 @@ class Monitor:
             "codex": {"configured": CODEX_PATH.exists()},
             "zai": {"configured": ZAI_PATH.exists()},
         }
+        # Pending in-panel Claude login: the PKCE verifier and state live only in
+        # memory, so an add-on restart simply requires starting the login again.
+        self.claude_login: dict[str, Any] | None = None
         try:
             saved = load_json(STATE_PATH)
             for provider in ("claude", "codex", "zai"):
@@ -544,6 +615,34 @@ class Monitor:
                 "last_poll": self.state.get("last_poll"),
             }
             atomic_write_json(STATE_PATH, persistable)
+
+    def start_claude_login(self) -> str:
+        verifier, challenge = claude_pkce_pair()
+        state = secrets.token_urlsafe(32)
+        with self.state_lock:
+            self.claude_login = {
+                "verifier": verifier,
+                "state": state,
+                "expires": time.time() + CLAUDE_LOGIN_TTL,
+            }
+        return claude_authorize_url(challenge, state)
+
+    def finish_claude_login(self, pasted: str) -> None:
+        with self.state_lock:
+            login, self.claude_login = self.claude_login, None
+        if login is None or login["expires"] < time.time():
+            raise ValueError("Вход не начат или устарел, нажмите «Войти в Claude»")
+        credentials = exchange_claude_code(pasted, login["verifier"], login["state"])
+        # A poll may be refreshing the old file right now; writing after it
+        # finishes keeps that poll from overwriting the new grant.
+        if not self.lock.acquire(timeout=REQUEST_TIMEOUT * 3):
+            raise RuntimeError("Опрос не завершился, повторите вход")
+        try:
+            atomic_write_json(CLAUDE_PATH, credentials)
+        finally:
+            self.lock.release()
+        self.update_provider("claude", configured=True, error=None)
+        logging.info("Claude login completed in the add-on")
 
     def poll_claude(self) -> None:
         if not CLAUDE_PATH.exists():
@@ -760,7 +859,7 @@ h1{font-size:24px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minma
 .ok{color:#34d399}.bad{color:#fb7185}.muted{color:#9ca3af}button,label{display:inline-block;margin-top:10px}button{background:#03a9f4;color:#06131b;border:0;border-radius:7px;padding:9px 14px;font-weight:600;cursor:pointer}input{max-width:100%}pre{white-space:pre-wrap;word-break:break-word;background:#111827;padding:10px;border-radius:7px}code{color:#93c5fd}
 </style></head><body><main>
 <h1>AI Usage Monitor</h1><p class="muted">Файлы сохраняются только в защищённом каталоге <code>/data</code> add-on.</p>
-<div class="grid"><section class="card"><h2>Claude</h2><div id="claude">Загрузка…</div><label>Файл <code>.claude/.credentials.json</code><br><input id="claudeFile" type="file" accept="application/json"></label><br><button onclick="upload('claude')">Импортировать</button></section>
+<div class="grid"><section class="card"><h2>Claude</h2><div id="claude">Загрузка…</div><button onclick="claudeLogin()">Войти в Claude</button><div id="claudeLogin" hidden><p class="muted">Подтвердите вход на открывшейся странице (<a id="claudeLoginUrl" target="_blank" rel="noopener">ссылка</a>) и вставьте показанный там код.</p><input id="claudeCode" type="password" autocomplete="off" placeholder="Код со страницы Claude"><br><button onclick="claudeFinish()">Завершить вход</button></div><details><summary class="muted">Импорт файла</summary><p class="muted">Копия файла рабочего CLI перестаёт работать, как только CLI обновит токен, — лучше вход выше.</p><label>Файл <code>.claude/.credentials.json</code><br><input id="claudeFile" type="file" accept="application/json"></label><br><button onclick="upload('claude')">Импортировать</button></details></section>
 <section class="card"><h2>Codex</h2><div id="codex">Загрузка…</div><label>Файл <code>.codex/auth.json</code><br><input id="codexFile" type="file" accept="application/json"></label><br><button onclick="upload('codex')">Импортировать</button></section>
 <section class="card"><h2>z.ai</h2><div id="zai">Загрузка…</div><label>Ключ Coding Plan<br><input id="zaiKey" type="password" autocomplete="off"></label><br><button onclick="saveZai()">Сохранить ключ</button></section></div>
 <p><button onclick="pollNow()">Обновить сейчас</button> <span id="message" class="muted"></span></p>
@@ -771,6 +870,8 @@ function escapeHtml(v){const d=document.createElement('div');d.textContent=v;ret
 async function refresh(){const s=await (await fetch(api('status'))).json();renderProvider('claude',s.claude||{});renderProvider('codex',s.codex||{});renderProvider('zai',s.zai||{});document.getElementById('message').textContent=s.polling?'Выполняется опрос…':''}
 async function upload(name){const f=document.getElementById(name+'File').files[0];if(!f){alert('Выберите JSON-файл');return}const r=await fetch(api('import/'+name),{method:'POST',headers:{'Content-Type':'application/json'},body:await f.text()});const j=await r.json();document.getElementById('message').textContent=j.message||j.error||'';await refresh()}
 async function saveZai(){const key=document.getElementById('zaiKey').value.trim();if(!key){alert('Введите ключ Coding Plan');return}const r=await fetch(api('import/zai'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:key})});document.getElementById('zaiKey').value='';const j=await r.json();document.getElementById('message').textContent=j.message||j.error||'';await refresh()}
+async function claudeLogin(){const j=await (await fetch(api('claude/login/start'),{method:'POST'})).json();document.getElementById('claudeLoginUrl').href=j.url;document.getElementById('claudeLogin').hidden=false;window.open(j.url,'_blank','noopener')}
+async function claudeFinish(){const code=document.getElementById('claudeCode').value.trim();if(!code){alert('Вставьте код со страницы Claude');return}const r=await fetch(api('claude/login/finish'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})});document.getElementById('claudeCode').value='';const j=await r.json();if(r.ok)document.getElementById('claudeLogin').hidden=true;document.getElementById('message').textContent=j.message||j.error||'';setTimeout(refresh,3000)}
 async function pollNow(){const r=await fetch(api('poll'),{method:'POST'});const j=await r.json();document.getElementById('message').textContent=j.message||j.error||'';setTimeout(refresh,2000)}
 refresh();setInterval(refresh,5000);
 </script></main></body></html>"""
@@ -791,6 +892,15 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
+
+    def read_json_body(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0 or length > MAX_IMPORT_SIZE:
+            raise ValueError("Некорректный размер файла")
+        value = json.loads(self.rfile.read(length).decode("utf-8-sig"))
+        if not isinstance(value, dict):
+            raise ValueError("Файл должен содержать JSON-объект")
+        return value
 
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
@@ -818,6 +928,25 @@ class WebHandler(BaseHTTPRequestHandler):
                 {"message": "Опрос запущен" if started else "Опрос уже выполняется"},
             )
             return
+        if path.endswith("/api/claude/login/start"):
+            self.send_json(HTTPStatus.OK, {"url": self.monitor.start_claude_login()})
+            return
+        if path.endswith("/api/claude/login/finish"):
+            try:
+                code = self.read_json_body().get("code")
+                if not isinstance(code, str):
+                    raise ValueError("Вставьте код со страницы Claude")
+                self.monitor.finish_claude_login(code)
+            except Exception as error:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": safe_error(error)})
+                return
+            threading.Thread(
+                target=self.monitor.poll_all, name="login-poll", daemon=True
+            ).start()
+            self.send_json(
+                HTTPStatus.OK, {"message": "Claude: вход выполнен, запущен опрос"}
+            )
+            return
         provider = None
         if path.endswith("/api/import/claude"):
             provider = "claude"
@@ -829,12 +958,7 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
             return
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length <= 0 or length > MAX_IMPORT_SIZE:
-                raise ValueError("Некорректный размер файла")
-            value = json.loads(self.rfile.read(length).decode("utf-8-sig"))
-            if not isinstance(value, dict):
-                raise ValueError("Файл должен содержать JSON-объект")
+            value = self.read_json_body()
             if provider == "claude":
                 validate_claude_credentials(value)
                 atomic_write_json(CLAUDE_PATH, value)

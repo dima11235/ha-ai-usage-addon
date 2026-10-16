@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import importlib.util
 import json
 import sys
@@ -6,6 +7,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 
 MODULE_PATH = (
@@ -288,6 +290,55 @@ class SchedulerTests(unittest.TestCase):
         now = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
         fake = self.FakeMonitor({"codex": {"5h_reset": "2026-09-08T11:59:30+00:00"}})
         self.assertEqual(monitor.next_poll_delay(fake, now), 120.0)
+
+
+class ClaudeLoginTests(unittest.TestCase):
+    def test_pkce_challenge_matches_verifier(self):
+        verifier, challenge = monitor.claude_pkce_pair()
+        digest = hashlib.sha256(verifier.encode()).digest()
+        expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+        self.assertEqual(challenge, expected)
+        self.assertGreaterEqual(len(verifier), 43)
+
+    def test_authorize_url_uses_manual_redirect(self):
+        query = parse_qs(urlsplit(monitor.claude_authorize_url("ch", "st")).query)
+        self.assertEqual(query["redirect_uri"], [monitor.CLAUDE_REDIRECT_URI])
+        self.assertEqual(query["code_challenge"], ["ch"])
+        self.assertEqual(query["code_challenge_method"], ["S256"])
+        self.assertEqual(query["state"], ["st"])
+        self.assertIn("user:profile", query["scope"][0].split())
+
+    def test_exchange_stores_add_on_owned_grant(self):
+        response = {
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "expires_in": 3600,
+            "scope": "user:profile user:inference",
+        }
+        with patch.object(
+            monitor, "http_request", return_value=(200, {}, response)
+        ) as request:
+            credentials = monitor.exchange_claude_code(" code#st ", "verifier", "st")
+        body = request.call_args.kwargs["json_body"]
+        self.assertEqual(body["grant_type"], "authorization_code")
+        self.assertEqual(body["code"], "code")
+        self.assertEqual(body["code_verifier"], "verifier")
+        oauth = credentials["claudeAiOauth"]
+        self.assertEqual(oauth["refreshToken"], "refresh")
+        self.assertEqual(oauth["scopes"], ["user:profile", "user:inference"])
+
+    def test_exchange_rejects_code_from_other_attempt(self):
+        with patch.object(monitor, "http_request") as request:
+            with self.assertRaisesRegex(ValueError, "другой попытки"):
+                monitor.exchange_claude_code("code#other", "verifier", "st")
+        request.assert_not_called()
+
+    def test_finish_requires_started_login(self):
+        fake = monitor.Monitor.__new__(monitor.Monitor)
+        fake.state_lock = monitor.threading.Lock()
+        fake.claude_login = None
+        with self.assertRaisesRegex(ValueError, "не начат"):
+            fake.finish_claude_login("code#st")
 
 
 if __name__ == "__main__":
