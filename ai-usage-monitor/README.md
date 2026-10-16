@@ -10,6 +10,17 @@ the z.ai Coding Plan key:
 - `.codex/auth.json`
 - z.ai Coding Plan API key (paste it into the password field)
 
+Claude rotates the refresh token on every refresh, so a copy of the file that
+the workstation CLI keeps using breaks with `invalid_grant` as soon as either
+side refreshes first. Give the add-on its own sign-in instead:
+
+```powershell
+$env:CLAUDE_CONFIG_DIR = "$env:TEMP\claude-ha-addon"
+claude   # run /login, then exit
+# import $env:TEMP\claude-ha-addon\.credentials.json, then delete the folder
+Remove-Item Env:CLAUDE_CONFIG_DIR
+```
+
 The credentials stay in the persistent private storage of this add-on. The
 default poll interval is 2 minutes, with an extra poll just after the nearest
 known reset. A failed provider does not block the other providers and does not
