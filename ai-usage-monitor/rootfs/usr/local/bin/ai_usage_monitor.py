@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import tempfile
 import threading
@@ -26,8 +27,17 @@ DATA_DIR = Path(os.getenv("AI_USAGE_DATA_DIR", "/data"))
 OPTIONS_PATH = Path(os.getenv("AI_USAGE_OPTIONS_PATH", str(DATA_DIR / "options.json")))
 CLAUDE_PATH = DATA_DIR / "claude_credentials.json"
 CODEX_PATH = DATA_DIR / "codex_auth.json"
+ACCOUNTS_PATH = DATA_DIR / "codex_accounts.json"
 ZAI_PATH = DATA_DIR / "zai_credentials.json"
 STATE_PATH = DATA_DIR / "state.json"
+
+
+def codex_path(account: str) -> Path:
+    """Keep legacy credentials and isolate every additional account."""
+    if not re.fullmatch(r"codex(?:[2-9]|[1-9][0-9]{1,8})?", account):
+        raise ValueError("Unknown Codex account slot")
+    return CODEX_PATH if account == "codex" else DATA_DIR / f"{account}_auth.json"
+
 
 HA_API = os.getenv("HA_API_URL", "http://supervisor/core/api").rstrip("/")
 SUPERVISOR_TOKEN = os.getenv("SUPERVISOR_TOKEN", "")
@@ -356,7 +366,7 @@ def codex_needs_refresh(credentials: dict[str, Any]) -> bool:
     return expiry is not None and expiry <= int(time.time()) + 60 * 60
 
 
-def refresh_codex(credentials: dict[str, Any]) -> str:
+def refresh_codex(credentials: dict[str, Any], path: Path | None = None) -> str:
     tokens = credentials["tokens"]
     old_account_id = tokens.get("account_id")
     _, _, response = http_request(
@@ -379,7 +389,7 @@ def refresh_codex(credentials: dict[str, Any]) -> str:
     if old_account_id and new_account_id != old_account_id:
         raise RuntimeError("Codex account changed during token refresh")
     credentials["last_refresh"] = iso_now()
-    atomic_write_json(CODEX_PATH, credentials)
+    atomic_write_json(path or CODEX_PATH, credentials)
     return tokens["access_token"]
 
 
@@ -401,7 +411,9 @@ def request_codex_device_code() -> dict[str, Any]:
     }
 
 
-def poll_codex_device_code(device_auth_id: str, user_code: str) -> dict[str, Any] | None:
+def poll_codex_device_code(
+    device_auth_id: str, user_code: str
+) -> dict[str, Any] | None:
     """Return the authorization code once approved, None while still pending."""
     try:
         _, _, response = http_request(
@@ -474,6 +486,8 @@ def publish_ha_update(
     windows: dict[str, dict[str, Any]],
     *,
     plan: str | None = None,
+    account_id: str | None = None,
+    account_name: str | None = None,
 ) -> None:
     """Publish usage data for the companion Home Assistant integration."""
     if not SUPERVISOR_TOKEN:
@@ -483,6 +497,9 @@ def publish_ha_update(
         "updated_at": updated_at,
         "windows": windows,
     }
+    if account_id is not None:
+        payload["account_id"] = account_id
+        payload["account_name"] = account_name
     if plan:
         payload["plan"] = plan
     http_request(
@@ -661,11 +678,27 @@ class Monitor:
         self.options = options
         self.lock = threading.Lock()
         self.state_lock = threading.Lock()
+        try:
+            account_config = load_json(ACCOUNTS_PATH)
+            self.accounts = account_config["accounts"]
+            self.next_account_id = int(account_config["next_id"])
+            if not isinstance(self.accounts, dict) or self.next_account_id < 2:
+                raise ValueError("Invalid Codex account configuration")
+            for account, metadata in self.accounts.items():
+                codex_path(account)
+                if not isinstance(metadata.get("name"), str):
+                    raise ValueError("Invalid Codex account name")
+        except FileNotFoundError:
+            self.accounts = {"codex": {"name": "Codex 1"}}
+            self.next_account_id = 2
         self.state: dict[str, Any] = {
             "started_at": iso_now(),
             "polling": False,
             "claude": {"configured": CLAUDE_PATH.exists()},
-            "codex": {"configured": CODEX_PATH.exists()},
+            **{
+                account: {"configured": codex_path(account).exists()}
+                for account in self.accounts
+            },
             "zai": {"configured": ZAI_PATH.exists()},
         }
         # Pending in-panel Claude login: the PKCE verifier and state live only in
@@ -673,10 +706,10 @@ class Monitor:
         self.claude_login: dict[str, Any] | None = None
         # Each Codex login attempt gets a new generation; a stale polling
         # thread notices the change and stops.
-        self.codex_login_generation = 0
+        self.codex_login_generation = {account: 0 for account in self.accounts}
         try:
             saved = load_json(STATE_PATH)
-            for provider in ("claude", "codex", "zai"):
+            for provider in ("claude", *self.accounts, "zai"):
                 if isinstance(saved.get(provider), dict):
                     self.state[provider].update(saved[provider])
         except Exception:
@@ -684,18 +717,88 @@ class Monitor:
 
     def snapshot(self) -> dict[str, Any]:
         with self.state_lock:
-            return json.loads(json.dumps(self.state))
+            return json.loads(json.dumps({**self.state, "accounts": self.accounts}))
 
     def update_provider(self, provider: str, **values: Any) -> None:
         with self.state_lock:
+            if provider.startswith("codex") and provider not in self.accounts:
+                return
             self.state.setdefault(provider, {}).update(values)
             persistable = {
                 "claude": self.state.get("claude", {}),
-                "codex": self.state.get("codex", {}),
+                **{account: self.state.get(account, {}) for account in self.accounts},
                 "zai": self.state.get("zai", {}),
                 "last_poll": self.state.get("last_poll"),
             }
             atomic_write_json(STATE_PATH, persistable)
+
+    def _save_accounts(self) -> None:
+        atomic_write_json(
+            ACCOUNTS_PATH, {"next_id": self.next_account_id, "accounts": self.accounts}
+        )
+
+    def add_codex_account(self, name: str) -> str:
+        name = self.validate_account_name(name)
+        with self.lock, self.state_lock:
+            account = f"codex{self.next_account_id}"
+            self.next_account_id += 1
+            self.accounts[account] = {"name": name}
+            try:
+                self._save_accounts()
+            except Exception:
+                self.accounts.pop(account)
+                raise
+            self.codex_login_generation[account] = 0
+            self.state[account] = {"configured": False}
+        return account
+
+    @staticmethod
+    def validate_account_name(name: Any) -> str:
+        if not isinstance(name, str) or not 1 <= len(name.strip()) <= 60:
+            raise ValueError("Название аккаунта должно содержать от 1 до 60 символов")
+        return name.strip()
+
+    def rename_codex_account(self, account: str, name: str) -> None:
+        name = self.validate_account_name(name)
+        with self.lock, self.state_lock:
+            if account not in self.accounts:
+                raise ValueError("Аккаунт не найден")
+            previous = self.accounts[account]
+            self.accounts[account] = {"name": name}
+            try:
+                self._save_accounts()
+            except Exception:
+                self.accounts[account] = previous
+                raise
+
+    def delete_codex_account(self, account: str) -> None:
+        with self.lock, self.state_lock:
+            if account not in self.accounts:
+                raise ValueError("Аккаунт не найден")
+            # Remove credentials first: if this fails the account stays usable.
+            codex_path(account).unlink(missing_ok=True)
+            previous = self.accounts.pop(account)
+            try:
+                self._save_accounts()
+            except Exception:
+                self.accounts[account] = previous
+                raise
+            self.codex_login_generation[account] += 1
+            self.state.pop(account, None)
+            self.state.pop(f"{account}_login", None)
+
+    def publish_accounts(self) -> None:
+        with self.state_lock:
+            accounts = [
+                {"id": key, "name": value["name"]}
+                for key, value in self.accounts.items()
+            ]
+        http_request(
+            f"{HA_API}/events/ai_usage_monitor_accounts",
+            method="POST",
+            headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"},
+            json_body={"accounts": accounts},
+        )
 
     def start_claude_login(self) -> str:
         verifier, challenge = claude_pkce_pair()
@@ -725,42 +828,60 @@ class Monitor:
         self.update_provider("claude", configured=True, error=None)
         logging.info("Claude login completed in the add-on")
 
-    def start_codex_login(self) -> dict[str, Any]:
+    def start_codex_login(self, provider: str = "codex") -> dict[str, Any]:
+        codex_path(provider)
+        with self.state_lock:
+            if provider not in self.accounts:
+                raise ValueError("Аккаунт не найден")
         device = request_codex_device_code()
         with self.state_lock:
-            self.codex_login_generation += 1
-            generation = self.codex_login_generation
-            self.state["codex_login"] = {
+            if provider not in self.accounts:
+                raise ValueError("Аккаунт удалён")
+            self.codex_login_generation[provider] += 1
+            generation = self.codex_login_generation[provider]
+            self.state[f"{provider}_login"] = {
                 "status": "pending",
                 "user_code": device["user_code"],
                 "url": CODEX_DEVICE_VERIFY_URL,
             }
         threading.Thread(
             target=self._complete_codex_login,
-            args=(generation, device),
-            name="codex-login",
+            args=(generation, device, provider),
+            name=f"{provider}-login",
             daemon=True,
         ).start()
-        return self.snapshot()["codex_login"]
+        return self.snapshot()[f"{provider}_login"]
 
-    def _codex_login_current(self, generation: int) -> bool:
+    def _codex_login_current(self, generation: int, provider: str = "codex") -> bool:
         with self.state_lock:
-            return generation == self.codex_login_generation
+            return (
+                provider in self.accounts
+                and generation == self.codex_login_generation.get(provider)
+            )
 
-    def _set_codex_login(self, generation: int, **values: Any) -> None:
+    def _set_codex_login(
+        self, generation: int, provider: str = "codex", **values: Any
+    ) -> None:
         with self.state_lock:
-            if generation == self.codex_login_generation:
-                self.state["codex_login"] = values
+            if (
+                provider in self.accounts
+                and generation == self.codex_login_generation.get(provider)
+            ):
+                self.state[f"{provider}_login"] = values
 
-    def _complete_codex_login(self, generation: int, device: dict[str, Any]) -> None:
+    def _complete_codex_login(
+        self, generation: int, device: dict[str, Any], provider: str = "codex"
+    ) -> None:
         deadline = time.time() + CODEX_LOGIN_TTL
         try:
             approved = None
             while approved is None:
-                if not self._codex_login_current(generation):
+                if not self._codex_login_current(generation, provider):
                     return
                 if time.time() > deadline:
-                    raise RuntimeError("Код не подтверждён за 15 минут, начните вход заново")
+                    raise RuntimeError(
+                        "Код не подтверждён за 15 минут, начните вход заново"
+                    )
                 time.sleep(device["interval"])
                 approved = poll_codex_device_code(
                     device["device_auth_id"], device["user_code"]
@@ -771,15 +892,23 @@ class Monitor:
             if not self.lock.acquire(timeout=REQUEST_TIMEOUT * 3):
                 raise RuntimeError("Опрос не завершился, повторите вход")
             try:
-                atomic_write_json(CODEX_PATH, credentials)
+                with self.state_lock:
+                    if (
+                        provider not in self.accounts
+                        or generation != self.codex_login_generation.get(provider)
+                    ):
+                        return
+                    atomic_write_json(codex_path(provider), credentials)
             finally:
                 self.lock.release()
         except Exception as error:
             logging.error("Codex login FAIL: %s", safe_error(error))
-            self._set_codex_login(generation, status="error", error=safe_error(error))
+            self._set_codex_login(
+                generation, provider, status="error", error=safe_error(error)
+            )
             return
-        self.update_provider("codex", configured=True, error=None)
-        self._set_codex_login(generation, status="done")
+        self.update_provider(provider, configured=True, error=None)
+        self._set_codex_login(generation, provider, status="done")
         logging.info("Codex login completed in the add-on")
         self.poll_all()
 
@@ -841,26 +970,27 @@ class Monitor:
         )
         logging.info("Claude OK: 5h=%s%%, weekly=%s%%", five_percent, week_percent)
 
-    def poll_codex(self) -> None:
-        if not CODEX_PATH.exists():
+    def poll_codex(self, provider: str = "codex") -> None:
+        path = codex_path(provider)
+        if not path.exists():
             self.update_provider(
-                "codex", configured=False, error="Credentials are not configured"
+                provider, configured=False, error="Credentials are not configured"
             )
             return
-        credentials = load_json(CODEX_PATH)
+        credentials = load_json(path)
         validate_codex_credentials(credentials)
         tokens = credentials["tokens"]
         access_token = tokens["access_token"]
         refreshed = False
         if codex_needs_refresh(credentials):
-            access_token = refresh_codex(credentials)
+            access_token = refresh_codex(credentials, path)
             refreshed = True
         try:
             usage = fetch_codex_usage(access_token, tokens["account_id"])
         except HttpFailure as error:
             if error.status != HTTPStatus.UNAUTHORIZED or refreshed:
                 raise
-            access_token = refresh_codex(credentials)
+            access_token = refresh_codex(credentials, path)
             usage = fetch_codex_usage(access_token, tokens["account_id"])
 
         windows, plan = parse_codex_usage(usage)
@@ -871,9 +1001,16 @@ class Monitor:
                 values[f"{window}_percent"] = window_data["used_percent"]
                 values[f"{window}_reset"] = window_data.get("resets_at")
         updated = iso_now()
-        publish_ha_update("codex", updated, windows, plan=plan)
+        publish_ha_update(
+            "codex",
+            updated,
+            windows,
+            plan=plan,
+            account_id=provider,
+            account_name=self.accounts[provider]["name"],
+        )
         self.update_provider(
-            "codex", configured=True, error=None, last_ok=updated, plan=plan, **values
+            provider, configured=True, error=None, last_ok=updated, plan=plan, **values
         )
         logging.info(
             "Codex OK: %s, plan=%s",
@@ -911,9 +1048,16 @@ class Monitor:
             self.state["polling"] = True
             self.state["last_poll"] = iso_now()
         try:
+            try:
+                self.publish_accounts()
+            except Exception as error:
+                logging.warning("Account sync FAIL: %s", safe_error(error))
             for provider, callback in (
                 ("claude", self.poll_claude),
-                ("codex", self.poll_codex),
+                *(
+                    (account, lambda key=account: self.poll_codex(key))
+                    for account in self.accounts
+                ),
                 ("zai", self.poll_zai),
             ):
                 try:
@@ -971,7 +1115,7 @@ def next_poll_delay(monitor: Monitor, now: datetime | None = None) -> float:
     current = now or utc_now()
     delay = float(int(monitor.options["interval_minutes"]) * 60)
     snapshot = monitor.snapshot()
-    for provider in ("claude", "codex", "zai"):
+    for provider in ("claude", *snapshot.get("accounts", {"codex": {}}), "zai"):
         state = snapshot.get(provider)
         if not isinstance(state, dict):
             continue
@@ -994,25 +1138,31 @@ PAGE = """<!doctype html>
 <title>AI Usage Monitor</title>
 <style>
 body{font:15px system-ui,sans-serif;margin:0;background:#111827;color:#e5e7eb}main{max-width:760px;margin:auto;padding:24px}
-h1{font-size:24px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}.card{background:#1f2937;border-radius:12px;padding:18px}
+h1{font-size:24px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}#codexAccounts{display:contents}.card{background:#1f2937;border-radius:12px;padding:18px}
 .ok{color:#34d399}.bad{color:#fb7185}.muted{color:#9ca3af}button,label{display:inline-block;margin-top:10px}button{background:#03a9f4;color:#06131b;border:0;border-radius:7px;padding:9px 14px;font-weight:600;cursor:pointer}input{max-width:100%}pre{white-space:pre-wrap;word-break:break-word;background:#111827;padding:10px;border-radius:7px}code{color:#93c5fd}
 </style></head><body><main>
 <h1>AI Usage Monitor</h1><p class="muted">Файлы сохраняются только в защищённом каталоге <code>/data</code> add-on.</p>
 <div class="grid"><section class="card"><h2>Claude</h2><div id="claude">Загрузка…</div><button onclick="claudeLogin()">Войти в Claude</button><div id="claudeLogin" hidden><p class="muted">Подтвердите вход на открывшейся странице (<a id="claudeLoginUrl" target="_blank" rel="noopener">ссылка</a>) и вставьте показанный там код.</p><input id="claudeCode" type="password" autocomplete="off" placeholder="Код со страницы Claude"><br><button onclick="claudeFinish()">Завершить вход</button></div><details><summary class="muted">Импорт файла</summary><p class="muted">Копия файла рабочего CLI перестаёт работать, как только CLI обновит токен, — лучше вход выше.</p><label>Файл <code>.claude/.credentials.json</code><br><input id="claudeFile" type="file" accept="application/json"></label><br><button onclick="upload('claude')">Импортировать</button></details></section>
-<section class="card"><h2>Codex</h2><div id="codex">Загрузка…</div><button onclick="codexLogin()">Войти в Codex</button><div id="codexLogin"></div><details><summary class="muted">Импорт файла</summary><p class="muted">Копия файла рабочего CLI делит с ним refresh token — лучше вход выше.</p><label>Файл <code>.codex/auth.json</code><br><input id="codexFile" type="file" accept="application/json"></label><br><button onclick="upload('codex')">Импортировать</button></details></section>
+<div id="codexAccounts"></div><section class="card"><h2>Добавить Codex</h2><input id="accountName" maxlength="60" placeholder="Название аккаунта"><br><button onclick="addAccount()">Добавить аккаунт</button></section>
 <section class="card"><h2>z.ai</h2><div id="zai">Загрузка…</div><label>Ключ Coding Plan<br><input id="zaiKey" type="password" autocomplete="off"></label><br><button onclick="saveZai()">Сохранить ключ</button></section></div>
 <p><button onclick="pollNow()">Обновить сейчас</button> <span id="message" class="muted"></span></p>
 <script>
 const api=p=>new URL('./api/'+p,location.href).toString();
 function renderProvider(name,p){const el=document.getElementById(name);const cls=p.error?'bad':'ok';const usage=name==='claude'?`5h: ${p.five_hour_percent??'—'}%, неделя: ${p.weekly_percent??'—'}%`:`5h: ${p['5h_percent']??'—'}%, неделя: ${p.weekly_percent??'—'}%`;el.innerHTML=`<p class="${cls}">${p.configured?(p.error?'Ошибка':'Настроено'):'Не настроено'}</p><p>${usage}</p><p class="muted">Последнее обновление: ${p.last_ok??'—'}</p>${p.error?`<pre>${escapeHtml(p.error)}</pre>`:''}`}
 function escapeHtml(v){const d=document.createElement('div');d.textContent=v;return d.innerHTML}
-async function refresh(){const s=await (await fetch(api('status'))).json();renderProvider('claude',s.claude||{});renderProvider('codex',s.codex||{});renderProvider('zai',s.zai||{});renderCodexLogin(s.codex_login);document.getElementById('message').textContent=s.polling?'Выполняется опрос…':''}
+async function refresh(){const s=await (await fetch(api('status'))).json();renderProvider('claude',s.claude||{});renderAccounts(s);renderProvider('zai',s.zai||{});document.getElementById('message').textContent=s.polling?'Выполняется опрос…':''}
+let accountSignature='';
+function renderAccounts(s){const entries=Object.entries(s.accounts||{});const signature=JSON.stringify(s.accounts||{});if(signature!==accountSignature){accountSignature=signature;document.getElementById('codexAccounts').innerHTML=entries.map(([id,a])=>`<section class="card"><h2>${escapeHtml(a.name)}</h2><div id="${id}"></div><button onclick="codexLogin('${id}')">Войти</button><div id="${id}Login"></div><details><summary>Настройки аккаунта</summary><input id="${id}Name" maxlength="60"><button onclick="renameAccount('${id}')">Переименовать</button><p class="muted">Сенсоры: ai_usage_monitor_${id}_usage_…</p><details><summary>Импорт файла</summary><p class="muted">Используйте отдельный вход выше, чтобы не делить токены с CLI.</p><input id="${id}File" type="file" accept="application/json"><button onclick="upload('${id}')">Импортировать</button></details><button onclick="deleteAccount('${id}')">Удалить аккаунт</button></details></section>`).join('');for(const [id,a] of entries)document.getElementById(id+'Name').value=a.name;}for(const [id] of entries){renderProvider(id,s[id]||{});renderCodexLogin(s[id+'_login'],id)}}
+async function accountAction(action,body){const r=await fetch(api('accounts/'+action),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();document.getElementById('message').textContent=j.error||j.message||'';await refresh();return r.ok}
+async function addAccount(){const el=document.getElementById('accountName');if(await accountAction('add',{name:el.value}))el.value=''}
+async function renameAccount(id){await accountAction('rename',{id,name:document.getElementById(id+'Name').value})}
+async function deleteAccount(id){if(confirm('Удалить аккаунт, его сохранённые токены и сенсоры HA?'))await accountAction('delete',{id})}
 async function upload(name){const f=document.getElementById(name+'File').files[0];if(!f){alert('Выберите JSON-файл');return}const r=await fetch(api('import/'+name),{method:'POST',headers:{'Content-Type':'application/json'},body:await f.text()});const j=await r.json();document.getElementById('message').textContent=j.message||j.error||'';await refresh()}
 async function saveZai(){const key=document.getElementById('zaiKey').value.trim();if(!key){alert('Введите ключ Coding Plan');return}const r=await fetch(api('import/zai'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:key})});document.getElementById('zaiKey').value='';const j=await r.json();document.getElementById('message').textContent=j.message||j.error||'';await refresh()}
 async function claudeLogin(){const j=await (await fetch(api('claude/login/start'),{method:'POST'})).json();document.getElementById('claudeLoginUrl').href=j.url;document.getElementById('claudeLogin').hidden=false;window.open(j.url,'_blank','noopener')}
 async function claudeFinish(){const code=document.getElementById('claudeCode').value.trim();if(!code){alert('Вставьте код со страницы Claude');return}const r=await fetch(api('claude/login/finish'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code})});document.getElementById('claudeCode').value='';const j=await r.json();if(r.ok)document.getElementById('claudeLogin').hidden=true;document.getElementById('message').textContent=j.message||j.error||'';setTimeout(refresh,3000)}
-function renderCodexLogin(l){const el=document.getElementById('codexLogin');if(!l){el.innerHTML='';return}if(l.status==='pending')el.innerHTML=`<p>Откройте <a href="${l.url}" target="_blank" rel="noopener">${l.url}</a> и введите код <b><code>${escapeHtml(l.user_code)}</code></b>. Панель обновится сама.</p>`;else if(l.status==='done')el.innerHTML='<p class="ok">Вход в Codex выполнен</p>';else el.innerHTML=`<pre>${escapeHtml(l.error||'Ошибка входа')}</pre>`}
-async function codexLogin(){const r=await fetch(api('codex/login/start'),{method:'POST'});const j=await r.json();if(!r.ok){document.getElementById('message').textContent=j.error||'';return}renderCodexLogin(j);window.open(j.url,'_blank','noopener')}
+function renderCodexLogin(l,name='codex'){const el=document.getElementById(name+'Login');if(!l){el.innerHTML='';return}if(l.status==='pending')el.innerHTML=`<p>Откройте <a href="${l.url}" target="_blank" rel="noopener">${l.url}</a> и введите код <b><code>${escapeHtml(l.user_code)}</code></b>. Панель обновится сама.</p>`;else if(l.status==='done')el.innerHTML='<p class="ok">Вход в Codex выполнен</p>';else el.innerHTML=`<pre>${escapeHtml(l.error||'Ошибка входа')}</pre>`}
+async function codexLogin(name='codex'){const r=await fetch(api(name+'/login/start'),{method:'POST'});const j=await r.json();if(!r.ok){document.getElementById('message').textContent=j.error||'';return}renderCodexLogin(j,name);window.open(j.url,'_blank','noopener')}
 async function pollNow(){const r=await fetch(api('poll'),{method:'POST'});const j=await r.json();document.getElementById('message').textContent=j.message||j.error||'';setTimeout(refresh,2000)}
 refresh();setInterval(refresh,5000);
 </script></main></body></html>"""
@@ -1069,9 +1219,13 @@ class WebHandler(BaseHTTPRequestHandler):
                 {"message": "Опрос запущен" if started else "Опрос уже выполняется"},
             )
             return
-        if path.endswith("/api/codex/login/start"):
+        if any(
+            path.endswith(f"/api/{slot}/login/start")
+            for slot in self.monitor.snapshot()["accounts"]
+        ):
+            provider = path.rstrip("/").split("/")[-3]
             try:
-                login = self.monitor.start_codex_login()
+                login = self.monitor.start_codex_login(provider)
             except Exception as error:
                 self.send_json(HTTPStatus.BAD_GATEWAY, {"error": safe_error(error)})
                 return
@@ -1096,11 +1250,35 @@ class WebHandler(BaseHTTPRequestHandler):
                 HTTPStatus.OK, {"message": "Claude: вход выполнен, запущен опрос"}
             )
             return
+        if any(
+            path.endswith(f"/api/accounts/{action}")
+            for action in ("add", "rename", "delete")
+        ):
+            try:
+                value = self.read_json_body()
+                if path.endswith("/add"):
+                    account = self.monitor.add_codex_account(value.get("name"))
+                elif path.endswith("/rename"):
+                    account = value.get("id")
+                    self.monitor.rename_codex_account(account, value.get("name"))
+                else:
+                    account = value.get("id")
+                    self.monitor.delete_codex_account(account)
+                threading.Thread(target=self.monitor.poll_all, daemon=True).start()
+                self.send_json(
+                    HTTPStatus.OK, {"id": account, "message": "Аккаунты обновлены"}
+                )
+            except Exception as error:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": safe_error(error)})
+            return
         provider = None
         if path.endswith("/api/import/claude"):
             provider = "claude"
-        elif path.endswith("/api/import/codex"):
-            provider = "codex"
+        elif any(
+            path.endswith(f"/api/import/{key}")
+            for key in self.monitor.snapshot()["accounts"]
+        ):
+            provider = path.split("/")[-1]
         elif path.endswith("/api/import/zai"):
             provider = "zai"
         if provider is None:
@@ -1111,9 +1289,15 @@ class WebHandler(BaseHTTPRequestHandler):
             if provider == "claude":
                 validate_claude_credentials(value)
                 atomic_write_json(CLAUDE_PATH, value)
-            elif provider == "codex":
+            elif provider.startswith("codex"):
                 validate_codex_credentials(value)
-                atomic_write_json(CODEX_PATH, value)
+                with self.monitor.lock:
+                    if provider not in self.monitor.accounts:
+                        raise ValueError("Аккаунт удалён")
+                    with self.monitor.state_lock:
+                        atomic_write_json(codex_path(provider), value)
+                        self.monitor.codex_login_generation[provider] += 1
+                        self.monitor.state.pop(f"{provider}_login", None)
             else:
                 validate_zai_credentials(value)
                 atomic_write_json(ZAI_PATH, {"api_key": zai_api_key(value)})

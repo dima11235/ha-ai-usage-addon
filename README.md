@@ -6,6 +6,7 @@ Codex, and z.ai without relying on a Windows scheduled task.
 The add-on:
 
 - polls Claude's 5-hour and weekly usage windows;
+- manages independent Codex accounts: add, rename, sign in, or delete each through Ingress;
 - detects Codex rate-limit windows from response headers;
 - reads z.ai Coding Plan 5-hour and weekly quota windows;
 - polls every 2 minutes and schedules an extra poll just after a known reset;
@@ -37,12 +38,23 @@ Install the companion custom integration from the Home Assistant configuration
 repository and add **AI Usage Monitor** under **Settings → Devices & services**.
 It listens for `ai_usage_monitor_update` events and owns these native entities:
 
-- `sensor.ai_usage_monitor_{claude,codex,zai}_usage_{5h,weekly}`
-- `sensor.ai_usage_monitor_{claude,codex,zai}_usage_{5h,weekly}_reset`
+- `sensor.ai_usage_monitor_{claude,codex,codex2,zai}_usage_{5h,weekly}`
+- `sensor.ai_usage_monitor_{claude,codex,codex2,zai}_usage_{5h,weekly}_reset`
 
 No Home Assistant helpers are required.
 
 ## OAuth behavior
+
+Version 0.7.0 requires companion integration 0.3.0+ for dynamic Codex accounts.
+Use **Добавить аккаунт** in Ingress, give it a name, then click **Войти** in its
+section. Approve the device code while signed into the intended OpenAI account
+(use a separate browser profile if needed). The original account remains in
+/data/codex_auth.json; additional accounts use /data/codex2_auth.json, etc.
+Names and monotonically increasing IDs persist in /data/codex_accounts.json.
+Renaming preserves entity IDs. Deleting removes credentials, cancels pending
+login, and removes its sensors from HA on the next account sync. The full list
+is published every poll so deletion also reconciles after HA downtime.
+z.ai monitoring remains available independently of dashboard visibility.
 
 Claude and Codex subscription limits are not the same as organization API usage.
 The add-on therefore uses the OAuth credentials created by the official CLIs.

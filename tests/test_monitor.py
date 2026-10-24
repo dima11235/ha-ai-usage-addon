@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 import json
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -385,6 +386,209 @@ class CodexLoginTests(unittest.TestCase):
         with patch.object(monitor, "http_request", return_value=(200, {}, response)):
             with self.assertRaisesRegex(ValueError, "account_id"):
                 monitor.exchange_codex_device_code(approved)
+
+
+class CodexAccountIsolationTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        for name, value in {
+            "DATA_DIR": root,
+            "CODEX_PATH": root / "codex_auth.json",
+            "STATE_PATH": root / "state.json",
+            "ACCOUNTS_PATH": root / "accounts.json",
+        }.items():
+            patcher = patch.object(monitor, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def make_monitor(self):
+        with patch.object(monitor, "load_json", side_effect=FileNotFoundError):
+            instance = monitor.Monitor({"interval_minutes": 2})
+        instance.add_codex_account("Second account")
+        return instance
+
+    def test_second_account_refresh_writes_only_its_file(self):
+        credentials = {
+            "tokens": {
+                "access_token": "old",
+                "refresh_token": "refresh2",
+                "account_id": "account2",
+            }
+        }
+        with (
+            patch.object(
+                monitor,
+                "http_request",
+                return_value=(
+                    200,
+                    {},
+                    {"access_token": "new", "refresh_token": "rotated2"},
+                ),
+            ),
+            patch.object(monitor, "atomic_write_json") as write,
+        ):
+            monitor.refresh_codex(credentials, monitor.codex_path("codex2"))
+        write.assert_called_once_with(monitor.codex_path("codex2"), credentials)
+        self.assertEqual(credentials["tokens"]["refresh_token"], "rotated2")
+
+    def test_second_account_poll_uses_its_credentials_and_event(self):
+        instance = self.make_monitor()
+        credentials = {
+            "tokens": {
+                "access_token": "access2",
+                "refresh_token": "refresh2",
+                "account_id": "account2",
+            }
+        }
+        usage = {
+            "plan_type": "plus",
+            "rate_limit": {
+                "primary_window": {"used_percent": 42, "limit_window_seconds": 18000}
+            },
+        }
+        with (
+            patch.object(monitor.Path, "exists", return_value=True),
+            patch.object(monitor, "load_json", return_value=credentials) as read,
+            patch.object(monitor, "codex_needs_refresh", return_value=False),
+            patch.object(monitor, "fetch_codex_usage", return_value=usage) as fetch,
+            patch.object(monitor, "publish_ha_update") as publish,
+            patch.object(monitor, "atomic_write_json"),
+        ):
+            instance.poll_codex("codex2")
+        read.assert_called_once_with(monitor.codex_path("codex2"))
+        fetch.assert_called_once_with("access2", "account2")
+        self.assertEqual(publish.call_args.args[0], "codex")
+        self.assertEqual(publish.call_args.kwargs["account_id"], "codex2")
+        self.assertEqual(instance.snapshot()["codex2"]["5h_percent"], 42)
+        self.assertNotIn("last_ok", instance.snapshot()["codex"])
+
+    def test_login_generations_are_independent(self):
+        instance = self.make_monitor()
+        device = {"device_auth_id": "device", "user_code": "AB-CD", "interval": 5}
+        with (
+            patch.object(monitor, "request_codex_device_code", return_value=device),
+            patch.object(monitor.threading, "Thread"),
+        ):
+            instance.start_codex_login()
+            instance.start_codex_login("codex2")
+            instance.start_codex_login("codex2")
+        self.assertTrue(instance._codex_login_current(1, "codex"))
+        self.assertFalse(instance._codex_login_current(1, "codex2"))
+        self.assertTrue(instance._codex_login_current(2, "codex2"))
+
+    def test_second_login_persists_to_its_slot(self):
+        instance = self.make_monitor()
+        instance.codex_login_generation["codex2"] = 1
+        credentials = {"tokens": {"account_id": "account2"}}
+        device = {"device_auth_id": "device", "user_code": "AB-CD", "interval": 0}
+        with (
+            patch.object(monitor, "poll_codex_device_code", return_value={}),
+            patch.object(
+                monitor, "exchange_codex_device_code", return_value=credentials
+            ),
+            patch.object(monitor, "atomic_write_json") as write,
+            patch.object(instance, "poll_all"),
+        ):
+            instance._complete_codex_login(1, device, "codex2")
+        self.assertEqual(
+            write.call_args_list[0].args, (monitor.codex_path("codex2"), credentials)
+        )
+        self.assertEqual(instance.snapshot()["codex2_login"]["status"], "done")
+        self.assertNotIn("codex_login", instance.snapshot())
+
+    def test_stale_login_does_not_overwrite_new_credentials(self):
+        instance = self.make_monitor()
+        instance.codex_login_generation["codex2"] = 1
+
+        def replace_login(_):
+            instance.codex_login_generation["codex2"] = 2
+            return {"tokens": {"account_id": "old"}}
+
+        device = {"device_auth_id": "device", "user_code": "AB-CD", "interval": 0}
+        with (
+            patch.object(monitor, "poll_codex_device_code", return_value={}),
+            patch.object(
+                monitor, "exchange_codex_device_code", side_effect=replace_login
+            ),
+            patch.object(monitor, "atomic_write_json") as write,
+        ):
+            instance._complete_codex_login(1, device, "codex2")
+        write.assert_not_called()
+
+    def test_second_account_reset_schedules_poll(self):
+        fake = SchedulerTests.FakeMonitor(
+            {
+                "accounts": {"codex2": {}},
+                "codex2": {"5h_reset": "2026-09-08T12:00:30+00:00"},
+            }
+        )
+        self.assertEqual(
+            monitor.next_poll_delay(
+                fake, datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+            ),
+            35,
+        )
+
+    def test_accounts_survive_restart_and_deleted_ids_are_not_reused(self):
+        instance = self.make_monitor()
+        monitor.codex_path("codex").write_text('{"original": true}', encoding="utf-8")
+        monitor.codex_path("codex2").write_text('{"second": true}', encoding="utf-8")
+        instance.rename_codex_account("codex2", "Work")
+        restored = monitor.Monitor({"interval_minutes": 2})
+        self.assertEqual(restored.snapshot()["accounts"]["codex2"]["name"], "Work")
+        restored.delete_codex_account("codex2")
+        self.assertFalse(monitor.codex_path("codex2").exists())
+        self.assertTrue(monitor.codex_path("codex").exists())
+        self.assertFalse(restored._codex_login_current(0, "codex2"))
+        self.assertEqual(restored.add_codex_account("Third"), "codex3")
+        self.assertNotIn("codex2", restored.snapshot()["accounts"])
+
+    def test_unknown_or_traversal_id_cannot_resolve_credentials(self):
+        for account in ("../codex", "codex/../../secret", "codex1", "codex0", "zai"):
+            with self.assertRaises(ValueError):
+                monitor.codex_path(account)
+
+    def test_http_account_lifecycle_and_login_route(self):
+        import urllib.request
+
+        instance = self.make_monitor()
+        handler = type("TestHandler", (monitor.WebHandler,), {"monitor": instance})
+        server = monitor.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        worker = monitor.threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+
+            def post(path, payload):
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{server.server_port}/ingress/api/{path}",
+                    data=json.dumps(payload).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    return json.load(response)
+
+            with (
+                patch.object(instance, "poll_all"),
+                patch.object(
+                    instance, "start_codex_login", return_value={"status": "pending"}
+                ) as login,
+            ):
+                account = post("accounts/add", {"name": "Third"})["id"]
+                self.assertEqual(account, "codex3")
+                post("accounts/rename", {"id": account, "name": "Renamed"})
+                self.assertEqual(
+                    instance.snapshot()["accounts"][account]["name"], "Renamed"
+                )
+                post(f"{account}/login/start", {})
+                login.assert_called_once_with(account)
+                post("accounts/delete", {"id": account})
+                self.assertNotIn(account, instance.snapshot()["accounts"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=5)
 
 
 if __name__ == "__main__":

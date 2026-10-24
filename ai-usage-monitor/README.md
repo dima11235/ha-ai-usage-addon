@@ -17,10 +17,16 @@ add-on then owns a separate OAuth grant. A copy of the workstation
 rotates it on every refresh, so whichever side refreshes second fails with
 `invalid_grant`. File import remains as a fallback.
 
-For Codex, press **Войти в Codex**: open the OpenAI page it links to and enter
+For Codex, press **Войти** in the account section: open the OpenAI page it links to and enter
 the short code shown in the panel; the add-on waits for the approval itself.
 If OpenAI reports that device code login is disabled, enable device code
 authorization for Codex in the ChatGPT security settings.
+
+Use **Добавить аккаунт** to monitor more Codex accounts. Each has a name, an
+independent sign-in, and its own rotating credentials. Account settings allow
+renaming or deletion. Renaming keeps the sensor IDs; deletion removes that
+account's credentials and HA sensors. The original account is preserved on
+upgrade. Companion integration 0.3.0+ is required for account management.
 
 The credentials stay in the persistent private storage of this add-on. The
 default poll interval is 2 minutes, with an extra poll just after the nearest
